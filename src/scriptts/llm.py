@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from math import log
 from typing import Protocol
@@ -133,6 +137,78 @@ class MockLLM:
     def _extract_after(self, text: str, key: str) -> str:
         m = re.search(rf"{re.escape(key)}[：:]\s*([^\n,，。]+)", text)
         return m.group(1).strip() if m else ""
+
+
+class OpenAICompatibleLLM:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "deepseek-v4-pro",
+        base_url: str = "https://api.deepseek.com",
+        timeout: int = 120,
+        thinking: str = "disabled",
+        reasoning_effort: str = "medium",
+    ) -> None:
+        self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("API backend needs --api-key or DEEPSEEK_API_KEY/OPENAI_API_KEY.")
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.thinking = thinking
+        self.reasoning_effort = reasoning_effort
+
+    def generate(self, prompt: str, max_new_tokens: int = 768, temperature: float = 0.7) -> Generation:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_new_tokens,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if self.thinking in {"enabled", "disabled"}:
+            payload["thinking"] = {"type": self.thinking}
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"API request failed with HTTP {exc.code}: {body}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"API request failed: {exc}") from exc
+
+        data = json.loads(raw)
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        text = str(message.get("content") or "").strip()
+        usage = data.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or rough_token_count(prompt))
+        completion_tokens = int(usage.get("completion_tokens") or rough_token_count(text))
+        diagnostics = {
+            "api_backend": 1.0,
+        }
+        if choice.get("finish_reason") == "length":
+            diagnostics["finish_reason_length"] = 1.0
+        if usage.get("total_tokens") is not None:
+            diagnostics["api_total_tokens"] = float(usage["total_tokens"])
+        return Generation(
+            text=text,
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            diagnostics=diagnostics,
+        )
 
 
 class HFLocalLLM:

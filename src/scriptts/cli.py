@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .data import read_jsonl, write_jsonl
-from .llm import HFLocalLLM, MockLLM
+from .llm import HFLocalLLM, MockLLM, OpenAICompatibleLLM
 from .pipeline import PipelineConfig, ScriptPipeline, save_result_markdown, save_trace_markdown
 
 
@@ -73,6 +73,15 @@ def main() -> None:
 def build_llm(args: argparse.Namespace):
     if args.backend == "mock":
         return MockLLM()
+    if args.backend == "deepseek":
+        return OpenAICompatibleLLM(
+            api_key=args.api_key,
+            model=args.api_model,
+            base_url=args.api_base_url,
+            timeout=args.api_timeout,
+            thinking=args.api_thinking,
+            reasoning_effort=args.api_reasoning_effort,
+        )
 
     model_path = args.model_path
     if not model_path:
@@ -108,12 +117,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-id", default="", help="Run a single task id, e.g. script_001.")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of tasks.")
 
-    parser.add_argument("--backend", choices=["auto", "hf", "mock"], default="auto")
+    parser.add_argument("--backend", choices=["auto", "hf", "mock", "deepseek"], default="auto")
     parser.add_argument("--model-path", default="", help="Local HF model path. Default: /data/fhy/models/Qwen3-0.6B")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16"], default="auto")
     parser.add_argument("--allow-remote-files", action="store_true", help="Allow transformers to fetch missing files.")
     parser.add_argument("--collect-token-stats", action="store_true", help="Collect generation entropy/top-1 diagnostics.")
+    parser.add_argument("--api-key", default="", help="API key for --backend deepseek. Prefer DEEPSEEK_API_KEY env var when possible.")
+    parser.add_argument("--api-base-url", default="https://api.deepseek.com", help="OpenAI-compatible API base URL.")
+    parser.add_argument("--api-model", default="deepseek-v4-pro", help="API model name.")
+    parser.add_argument("--api-timeout", type=int, default=120, help="API request timeout in seconds.")
+    parser.add_argument("--api-thinking", choices=["enabled", "disabled", "omit"], default="disabled", help="DeepSeek thinking mode payload.")
+    parser.add_argument("--api-reasoning-effort", choices=["low", "medium", "high", ""], default="medium", help="Reasoning effort for compatible APIs.")
 
     parser.add_argument("--judge-backend", choices=["rule", "llm", "hybrid"], default="llm")
     parser.add_argument("--max-branches", type=int, default=2)

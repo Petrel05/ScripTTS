@@ -146,18 +146,40 @@ class ScriptPipeline:
         started = time.time()
         stats = PipelineStats()
 
-        def call(prompt: str, max_new_tokens: int | None = None, temperature: float | None = None) -> str:
+        def call(
+            prompt: str,
+            max_new_tokens: int | None = None,
+            temperature: float | None = None,
+            expect_json: bool = False,
+        ) -> str:
+            token_limit = max_new_tokens or self.config.max_new_tokens
             generation = self.llm.generate(
                 prompt,
-                max_new_tokens=max_new_tokens or self.config.max_new_tokens,
+                max_new_tokens=token_limit,
                 temperature=self.config.temperature if temperature is None else temperature,
             )
             stats.add_generation(generation.input_tokens, generation.output_tokens, generation.diagnostics)
-            return generation.text.strip()
+            text = generation.text.strip()
+            needs_retry = bool(generation.diagnostics.get("finish_reason_length"))
+            if expect_json and _extract_json_object(text) is None:
+                needs_retry = True
+            if needs_retry:
+                retry_limit = min(max(token_limit * 2, token_limit + 512), 3072)
+                if retry_limit > token_limit:
+                    retry = self.llm.generate(
+                        prompt,
+                        max_new_tokens=retry_limit,
+                        temperature=self.config.temperature if temperature is None else temperature,
+                    )
+                    stats.add_generation(retry.input_tokens, retry.output_tokens, retry.diagnostics)
+                    retry_text = retry.text.strip()
+                    if not expect_json or _extract_json_object(retry_text) is not None or len(retry_text) > len(text):
+                        text = retry_text
+            return text
 
         raw_outputs: dict[str, Any] = {}
 
-        task_card_raw = call(_normalization_prompt(task), temperature=0.2)
+        task_card_raw = call(_normalization_prompt(task), temperature=0.2, expect_json=True)
         raw_outputs["task_card"] = task_card_raw
         task_card_data = _coerce_task_card(task, task_card_raw)
         task_card = _compact_json(task_card_data)
@@ -167,7 +189,7 @@ class ScriptPipeline:
         previous_seed = ""
         initial_count = min(max(self.config.min_branches, 1), self.config.max_branches)
         for idx in range(1, initial_count + 1):
-            seed_raw = call(_seed_prompt(task, task_card, idx, previous_seed))
+            seed_raw = call(_seed_prompt(task, task_card, idx, previous_seed), expect_json=True)
             raw_outputs[f"branch_{idx}_seed"] = seed_raw
             seed_data = _coerce_seed(seed_raw, idx)
             seed = _format_seed(seed_data)
@@ -182,6 +204,7 @@ class ScriptPipeline:
             previous_seed += "\n" + seed
             controller_events.append(_controller_event("INIT_BRANCH", branch.branch_id, "seed", branch.status, score.to_dict(), invalid_reason or "initial_seed"))
 
+        _rescue_seed_branches(branches, self.config.max_active_branches, controller_events)
         active = _controller_prune(
             branches,
             self.config.max_active_branches,
@@ -192,7 +215,7 @@ class ScriptPipeline:
         )
 
         for branch in list(active):
-            storyline_raw = call(_storyline_prompt(task, task_card, branch.seed))
+            storyline_raw = call(_storyline_prompt(task, task_card, branch.seed), expect_json=True)
             raw_outputs[f"branch_{branch.branch_id}_storyline"] = storyline_raw
             branch.storyline_data = _coerce_storyline(storyline_raw)
             branch.storyline = _format_storyline(branch.storyline_data)
@@ -211,7 +234,7 @@ class ScriptPipeline:
                     continue
                 new_id = max(branch.branch_id for branch in branches) + 1
                 siblings = "\n".join(branch.seed for branch in branches)
-                fork_raw = call(_fork_seed_prompt(task, task_card, parent, new_id, siblings), temperature=min(self.config.temperature + 0.15, 1.0))
+                fork_raw = call(_fork_seed_prompt(task, task_card, parent, new_id, siblings), temperature=min(self.config.temperature + 0.15, 1.0), expect_json=True)
                 raw_outputs[f"branch_{new_id}_fork_seed"] = fork_raw
                 fork_seed_data = _coerce_seed(fork_raw, new_id)
                 fork_seed = _format_seed(fork_seed_data)
@@ -223,7 +246,7 @@ class ScriptPipeline:
                 stats.branch_count += 1
                 controller_events.append(_controller_event("FORK_BRANCH", fork_branch.branch_id, "storyline", "active", seed_score.to_dict(), f"parent={parent.branch_id}"))
 
-                storyline_raw = call(_storyline_prompt(task, task_card, fork_branch.seed))
+                storyline_raw = call(_storyline_prompt(task, task_card, fork_branch.seed), expect_json=True)
                 raw_outputs[f"branch_{fork_branch.branch_id}_storyline"] = storyline_raw
                 fork_branch.storyline_data = _coerce_storyline(storyline_raw)
                 fork_branch.storyline = _format_storyline(fork_branch.storyline_data)
@@ -243,7 +266,7 @@ class ScriptPipeline:
         )
 
         for branch in list(active):
-            characters_raw = call(_character_prompt(task, task_card, branch.storyline))
+            characters_raw = call(_character_prompt(task, task_card, branch.storyline), expect_json=True)
             raw_outputs[f"branch_{branch.branch_id}_characters"] = characters_raw
             branch.characters_data = _coerce_characters(characters_raw)
             branch.characters = _format_characters(branch.characters_data)
@@ -262,7 +285,7 @@ class ScriptPipeline:
         )
 
         for branch in list(active):
-            outline_raw = call(_outline_prompt(task, task_card, branch.storyline, branch.characters))
+            outline_raw = call(_outline_prompt(task, task_card, branch.storyline, branch.characters), expect_json=True)
             raw_outputs[f"branch_{branch.branch_id}_outline"] = outline_raw
             branch.outline_data = _coerce_outline(outline_raw)
             branch.outline = _format_outline(branch.outline_data)
@@ -306,6 +329,7 @@ class ScriptPipeline:
                         total_scene_goals=len(branch.scene_goals or []),
                     ),
                     max_new_tokens=self.config.scene_max_new_tokens,
+                    expect_json=True,
                 )
                 raw_outputs[f"branch_{branch.branch_id}_scene_{scene_idx}"] = scene_raw
                 scene_data = _coerce_scene(scene_raw, scene_idx, scene_goal, branch.characters_data)
@@ -315,6 +339,8 @@ class ScriptPipeline:
                 score_dict = score.to_dict()
                 branch.scores["scene"] = score_dict
                 stop, reason = _branch_scene_stop(branch, score, scene_idx, self.config.min_scenes)
+                if scene_data.get("parse_error"):
+                    stop, reason = True, "scene_parse_error"
                 decision = "accept_and_stop" if stop else "accept"
                 branch.scenes.append(
                     {
@@ -330,7 +356,7 @@ class ScriptPipeline:
                 )
                 branch.stage = f"scene_{scene_idx}"
                 if stop:
-                    branch.status = "completed"
+                    branch.status = "pruned" if reason in {"scene_parse_error", "premise_flaw", "low_logic_consistency", "low_overall_quality"} else "completed"
                     stats.stopped_scene_count += 1
                 branch.decisions.append(_decision_event(f"scene_{scene_idx}", decision, reason, score_dict))
                 controller_events.append(_controller_event("EXPAND_SCENE", branch.branch_id, f"scene_{scene_idx}", branch.status, score_dict, reason))
@@ -350,17 +376,40 @@ class ScriptPipeline:
                 controller_events.append(_controller_event("COMPLETE_BRANCH", branch.branch_id, "max_depth", branch.status, branch.latest_score(), "reached_max_scenes"))
 
         candidates = [branch for branch in branches if branch.scenes and branch.status != "pruned"]
+        fallback_scene_mode = False
         if not candidates:
-            candidates = [branch for branch in branches if branch.scenes] or branches
+            candidates = [branch for branch in branches if branch.status != "pruned"] or branches
+            for branch in candidates:
+                if not branch.scenes:
+                    branch.scenes = _synthesize_fallback_scenes(branch)
+                    branch.decisions.append(_decision_event("fallback", "synthesize_scenes", "no_scene_generated", branch.latest_score()))
+                    controller_events.append(_controller_event("SYNTHESIZE_SCENES", branch.branch_id, "fallback", branch.status, branch.latest_score(), "no_scene_generated"))
+            fallback_scene_mode = True
+        if not candidates:
+            raise RuntimeError("No viable branch reached final selection; inspect traces/raw outputs for rejected branches.")
         for branch in candidates:
             final_text = _compose_final_script(task, branch.characters, branch.outline, branch.scenes)
             final_score = self._final_judge(final_text, _final_judge_context(task, branch), stats)
             final_score = _calibrate_final_completion(final_score, branch)
             branch.scores["final"] = final_score.to_dict()
-            branch.decisions.append(_decision_event("final", "candidate", "final_judge", final_score.to_dict()))
-            controller_events.append(_controller_event("FINAL_JUDGE", branch.branch_id, "final", branch.status, final_score.to_dict(), "candidate"))
+            final_invalid, final_invalid_reason = _invalid_reason(final_score)
+            if final_invalid:
+                branch.status = "pruned"
+            final_decision = "reject" if final_invalid else "candidate"
+            final_reason = final_invalid_reason or "final_judge"
+            branch.decisions.append(_decision_event("final", final_decision, final_reason, final_score.to_dict()))
+            controller_events.append(_controller_event("FINAL_JUDGE", branch.branch_id, "final", branch.status, final_score.to_dict(), final_reason))
 
-        best_final_branch = max(candidates, key=_branch_rank)
+        final_candidates = [branch for branch in candidates if branch.status != "pruned"]
+        if not final_candidates:
+            final_candidates = sorted(candidates, key=_branch_rank, reverse=True)
+            for branch in final_candidates:
+                if branch.status == "pruned":
+                    branch.status = "completed"
+            fallback_final = True
+        else:
+            fallback_final = False
+        best_final_branch = max(final_candidates, key=_branch_rank)
         final_script = _compose_final_script(task, best_final_branch.characters, best_final_branch.outline, best_final_branch.scenes)
         final_score = JudgeScores(
             novelty=float(best_final_branch.scores.get("final", {}).get("novelty", 3)),
@@ -371,7 +420,11 @@ class ScriptPipeline:
             overall_quality=float(best_final_branch.scores.get("final", {}).get("overall_quality", 3)),
             comments=str(best_final_branch.scores.get("final", {}).get("comments", "selected_final")),
         )
-        controller_events.append(_controller_event("SELECT_FINAL", best_final_branch.branch_id, "final", "selected", final_score.to_dict(), "best_rank"))
+        if fallback_scene_mode:
+            select_reason = "fallback_scene_mode"
+        else:
+            select_reason = "fallback_best_invalid" if fallback_final else "best_rank"
+        controller_events.append(_controller_event("SELECT_FINAL", best_final_branch.branch_id, "final", "selected", final_score.to_dict(), select_reason))
         stats.stopped_branch_count = len([branch for branch in branches if branch.status == "pruned"])
         stats.wall_time = time.time() - started
 
@@ -397,6 +450,10 @@ class ScriptPipeline:
             "outline_data": best_final_branch.outline_data,
             "scenes": best_final_branch.scenes,
             "final_score": final_score.to_dict(),
+            "final_selection": {
+                "status": "fallback_invalid" if fallback_final else "selected",
+                "reason": select_reason,
+            },
             "metrics": stats.to_dict(),
             "raw_outputs": raw_outputs,
         }
@@ -468,6 +525,21 @@ def _controller_prune(
         branch.decisions.append(_decision_event(stage, "prune", "controller_width_limit", score))
         controller_events.append(_controller_event("PRUNE_BRANCH", branch.branch_id, stage, "pruned", score, "controller_width_limit"))
     return keep
+
+
+def _rescue_seed_branches(
+    branches: list[BranchState],
+    max_active: int,
+    controller_events: list[dict[str, Any]],
+) -> None:
+    if any(branch.status == "active" for branch in branches):
+        return
+    ranked = sorted(branches, key=_branch_rank, reverse=True)
+    for branch in ranked[: max(1, max_active)]:
+        score = branch.latest_score()
+        branch.status = "active"
+        branch.decisions.append(_decision_event("seed", "rescue", "all_initial_seeds_pruned", score))
+        controller_events.append(_controller_event("RESCUE_BRANCH", branch.branch_id, "seed", "active", score, "all_initial_seeds_pruned"))
 
 
 def _branch_rank(branch: BranchState) -> float:
@@ -990,6 +1062,7 @@ def _format_characters(data: dict[str, Any]) -> str:
 
 def _coerce_outline(raw: str) -> dict[str, Any]:
     data = _extract_json_object(raw) or {}
+    json_like_outline = '"scenes"' in raw or '{"scenes"' in raw or "```json" in raw
     scenes = data.get("scenes") or data.get("分场大纲") or []
     parsed_scenes = []
     if isinstance(scenes, list):
@@ -1010,10 +1083,12 @@ def _coerce_outline(raw: str) -> dict[str, Any]:
                 parsed_scenes.append({"scene_id": idx, "title": f"第{idx}场", "location": "", "event": item, "conflict": "", "reveal": "", "hook": ""})
     if not parsed_scenes:
         fallback_text = _clean_model_text(raw)
-        if '"scenes"' in raw or '{"scenes"' in raw:
+        if json_like_outline:
             fallback_text = ""
         parsed_scenes = _parse_outline_lines(fallback_text)
     if not parsed_scenes:
+        if json_like_outline:
+            return {"scenes": [], "parse_error": True}
         parsed_scenes = _default_outline_scenes()
     return {"scenes": parsed_scenes[:5]}
 
@@ -1035,6 +1110,17 @@ def _format_outline(data: dict[str, Any]) -> str:
 
 def _coerce_scene(raw: str, scene_idx: int, scene_goal: str, characters_data: dict[str, Any] | None = None) -> dict[str, Any]:
     data = _extract_json_object(raw) or {}
+    json_like_scene = '"dialogue"' in raw or '"scene_id"' in raw or "```json" in raw
+    if not data and json_like_scene:
+        return {
+            "scene_id": scene_idx,
+            "location_time": "地点 / 时间",
+            "stage_direction": scene_goal,
+            "action_beats": [],
+            "dialogue": [],
+            "hook": "",
+            "parse_error": True,
+        }
     dialogue = data.get("dialogue") or data.get("对白") or []
     parsed_dialogue = []
     fallback_speakers = _character_names(characters_data)
@@ -1528,6 +1614,48 @@ def _extract_scene_goals(outline: str, max_scenes: int, outline_data: dict[str, 
     if not goals:
         goals = ["开端与异常出现", "冲突升级与误导线索", "真相揭示与反转收束"]
     return goals[: max(max_scenes, len(goals))]
+
+
+def _synthesize_fallback_scenes(branch: BranchState) -> list[dict[str, Any]]:
+    outline_data = branch.outline_data if isinstance(branch.outline_data, dict) else {}
+    outline_scenes = outline_data.get("scenes") if isinstance(outline_data.get("scenes"), list) else []
+    if not outline_scenes and branch.outline:
+        outline_scenes = _parse_outline_lines(branch.outline)
+    if not outline_scenes:
+        outline_scenes = _default_outline_scenes()
+
+    fallback_scenes: list[dict[str, Any]] = []
+    for idx, item in enumerate(outline_scenes, start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or f"第{idx}场").strip()
+        location = str(item.get("location") or "地点 / 时间").strip()
+        event = str(item.get("event") or "").strip()
+        conflict = str(item.get("conflict") or "").strip()
+        reveal = str(item.get("reveal") or "").strip()
+        hook = str(item.get("hook") or "").strip()
+        text_lines = [f"第 {idx} 场：{location if location else title}"]
+        if event:
+            text_lines.append(f"【舞台说明】{event}")
+        if conflict:
+            text_lines.append(f"【动作】{conflict}")
+        if reveal:
+            text_lines.append(f"【动作】{reveal}")
+        if hook:
+            text_lines.append(f"【本场结尾钩子】{hook}")
+        fallback_scenes.append(
+            {
+                "scene_id": item.get("scene_id") or idx,
+                "goal": "；".join(part for part in [title, event, conflict, reveal, hook] if part),
+                "raw_text": "",
+                "scene_data": item,
+                "text": "\n".join(text_lines).strip(),
+                "score": {},
+                "decision": "synthesized",
+                "decision_reason": "fallback_scene_mode",
+            }
+        )
+    return fallback_scenes[:5]
 
 
 def _compose_final_script(task: ScriptTask, characters: str, outline: str, scenes: list[dict[str, Any]]) -> str:
