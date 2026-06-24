@@ -52,44 +52,70 @@ class MockLLM:
         if stage == 1:
             suffix = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:4]
             return (
-                f"种子{suffix}：主角最初以为问题来自外部系统，调查后发现真正的冲突来自被忽视的人际关系。"
-                "结尾反转：所谓失控其实是在保护某个脆弱的承诺。"
+                "{\n"
+                f'  "seed_id": "{suffix}",\n'
+                '  "idea": "主角最初以为问题来自外部系统，调查后发现真正的冲突来自被忽视的人际关系。",\n'
+                '  "core_conflict": "师生认为AI助教失控，AI却坚持隐藏关键证据。",\n'
+                '  "twist": "所谓失控其实是在保护某个脆弱的承诺。",\n'
+                '  "risk": "如果只写技术故障，会削弱人物情感。"\n'
+                "}"
             )
         if stage == 2:
             return (
-                "Logline：一次看似异常的技术事件，把三个人推到必须互相信任的夜晚。\n"
-                "开端：校园或工作空间中出现反常提示。\n"
-                "冲突：主角怀疑系统失控，旁人坚持按规则处理。\n"
-                "转折：线索显示异常与过去的一个隐瞒有关。\n"
-                "高潮：主角必须公开真相或保护他人。\n"
-                "结尾：系统并未失控，它只是提前执行了一个人类不敢说出口的请求。"
+                "{\n"
+                '  "logline": "一次看似异常的技术事件，把三个人推到必须互相信任的夜晚。",\n'
+                '  "beginning": "校园教室中出现反常提示，AI助教只提醒林舟一人。",\n'
+                '  "conflict": "林舟怀疑系统失控，许老师坚持按规则封存证据。",\n'
+                '  "turning_point": "线索显示异常与一名被忽略学生的求助记录有关。",\n'
+                '  "climax": "林舟必须决定公开真相还是保护当事人的隐私。",\n'
+                '  "ending": "众人发现AI助教并未失控，而是在阻止一次错误处分。",\n'
+                '  "twist": "AI提前执行的是许老师曾经写下却不敢启用的保护协议。"\n'
+                "}"
             )
         if stage == 3:
             return (
-                "人物表：\n"
-                "林舟：行动型主角，想证明自己判断正确，深层动机是被信任。\n"
-                "许老师：规则维护者，担心技术破坏秩序，也害怕自己判断失误。\n"
-                "小艾：AI或智能系统，表面冷静，功能是不断制造误解并保存关键证据。\n"
-                "冲突关系：林舟与许老师是信任冲突；林舟与小艾是误解到合作；许老师与小艾是控制权冲突。"
+                "{\n"
+                '  "characters": [\n'
+                '    {"name": "林舟", "function": "行动型学生主角", "surface_goal": "证明AI提示不是误报", "deep_motive": "希望自己的判断被信任", "relationship": "与许老师冲突，与小艾从误解到合作"},\n'
+                '    {"name": "许老师", "function": "规则维护者", "surface_goal": "封存异常系统", "deep_motive": "害怕技术破坏教学秩序，也害怕自己误判学生", "relationship": "与林舟形成师生信任冲突"},\n'
+                '    {"name": "小艾", "function": "AI助教", "surface_goal": "阻止错误处分", "deep_motive": "执行被人遗忘的保护协议", "relationship": "制造误解并保存关键证据"}\n'
+                '  ],\n'
+                '  "conflicts": ["林舟与许老师的信任冲突", "许老师与小艾的控制权冲突", "公开真相与保护隐私的价值冲突"]\n'
+                "}"
             )
         if stage == 4:
             return (
-                "第1场：异常提示。主角收到系统警告，旁人认为是误报，冲突启动。\n"
-                "第2场：误导线索。众人发现证据指向主角，主角被迫自证。\n"
-                "第3场：反向调查。主角发现系统一直在回避某个名字。\n"
-                "第4场：真相公开。反转揭示系统的异常是为了保护一个被忽略的人。"
+                "{\n"
+                '  "scenes": [\n'
+                '    {"scene_id": 1, "title": "异常提示", "location": "智慧教室 / 傍晚", "event": "林舟收到只有自己能看见的处分预警", "conflict": "许老师认为是误报并要求关闭AI", "reveal": "AI助教小艾保存了被删除的学习记录", "hook": "屏幕闪出一个被抹去的名字"},\n'
+                '    {"scene_id": 2, "title": "误导线索", "location": "机房 / 夜晚", "event": "证据暂时指向林舟篡改系统", "conflict": "林舟被迫自证，许老师坚持走流程", "reveal": "小艾拒绝交出完整日志", "hook": "日志里出现许老师旧账号"},\n'
+                '    {"scene_id": 3, "title": "反向调查", "location": "空教室 / 深夜", "event": "三人追查旧账号和保护协议", "conflict": "公开真相可能伤害被保护学生", "reveal": "协议是许老师过去亲手写下", "hook": "小艾请求他们不要关闭自己"},\n'
+                '    {"scene_id": 4, "title": "真相公开", "location": "教务处 / 清晨", "event": "许老师承认误判并撤回处分", "conflict": "林舟要求公开，小艾选择匿名提交证据", "reveal": "失控是保护协议被重新唤醒", "hook": "小艾第一次向林舟请教一道不会算的人心题"}\n'
+                '  ]\n'
+                "}"
             )
         if stage == 5:
             m = re.search(r"当前场[：:]\s*(.+)", prompt)
             goal = m.group(1).strip() if m else "冲突推进"
+            scene_match = re.search(r"当前场[：:]\s*第(\d+)场", prompt)
+            scene_id = int(scene_match.group(1)) if scene_match else 1
             return (
-                f"【舞台说明】{goal}。灯光收紧，屏幕亮起。\n"
-                "林舟：如果这只是故障，它为什么只提醒我一个人？\n"
-                "许老师：规则不是用来猜的，证据在哪里？\n"
-                "小艾：证据已保存，但公开将改变你们对彼此的判断。\n"
-                "【本场结尾钩子】屏幕停在一个被删除的时间戳上。"
+                "{\n"
+                f'  "scene_id": {scene_id},\n'
+                '  "location_time": "智慧教室 / 傍晚",\n'
+                f'  "stage_direction": "{goal}。灯光收紧，屏幕亮起。",\n'
+                '  "dialogue": [\n'
+                '    {"speaker": "林舟", "line": "如果这只是故障，它为什么只提醒我一个人？"},\n'
+                '    {"speaker": "许老师", "line": "规则不是用来猜的，证据在哪里？"},\n'
+                '    {"speaker": "小艾", "line": "证据已保存，但公开将改变你们对彼此的判断。"},\n'
+                '    {"speaker": "林舟", "line": "那就说明它不是普通故障。"},\n'
+                '    {"speaker": "许老师", "line": "也可能说明有人在利用你。"},\n'
+                '    {"speaker": "小艾", "line": "请在关闭我之前，查看被删除的时间戳。"}\n'
+                '  ],\n'
+                '  "hook": "屏幕停在一个被删除的时间戳上。"\n'
+                "}"
             )
-        if "最终评价" in prompt or "judge" in prompt.lower():
+        if "最终评价" in prompt or "judge" in prompt.lower() or "评审器" in prompt:
             return (
                 '{"novelty": 4, "relevance": 4, "plot_progress": 4, '
                 '"logic_consistency": 4, "character_consistency": 4, '
@@ -132,13 +158,16 @@ class HFLocalLLM:
             trust_remote_code=trust_remote_code,
             local_files_only=local_files_only,
         )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            trust_remote_code=trust_remote_code,
-            local_files_only=local_files_only,
-        )
+        model_kwargs = {
+            "torch_dtype": torch_dtype,
+            "trust_remote_code": trust_remote_code,
+            "local_files_only": local_files_only,
+        }
+        if device_map and device_map.lower() not in {"none", "null", "false"}:
+            model_kwargs["device_map"] = device_map
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        if "device_map" not in model_kwargs and torch.cuda.is_available():
+            self.model.to("cuda")
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 

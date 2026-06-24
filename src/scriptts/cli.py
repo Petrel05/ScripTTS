@@ -28,6 +28,7 @@ def main() -> None:
     config = PipelineConfig(
         max_branches=args.max_branches,
         max_scenes=args.max_scenes,
+        min_scenes=args.min_scenes,
         max_new_tokens=args.max_new_tokens,
         scene_max_new_tokens=args.scene_max_new_tokens,
         temperature=args.temperature,
@@ -104,6 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-backend", choices=["rule", "llm"], default="rule")
     parser.add_argument("--max-branches", type=int, default=2)
     parser.add_argument("--max-scenes", type=int, default=4)
+    parser.add_argument("--min-scenes", type=int, default=3)
     parser.add_argument("--max-new-tokens", type=int, default=768)
     parser.add_argument("--scene-max-new-tokens", type=int, default=768)
     parser.add_argument("--temperature", type=float, default=0.7)

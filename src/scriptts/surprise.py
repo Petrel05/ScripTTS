@@ -32,20 +32,33 @@ def rule_judge(candidate: str, task_prompt: str = "", previous_text: str = "") -
     text = candidate.strip()
     prompt_terms = _content_terms(task_prompt)
     relevance_hits = sum(1 for term in prompt_terms if term in text)
-    relevance = _clamp(3.0 + min(relevance_hits, 4) * 0.35)
+    relevance = _clamp(2.4 + min(relevance_hits, 6) * 0.35)
 
     surprise_markers = ["反转", "转折", "真相", "误会", "秘密", "异常", "发现", "揭示", "选择"]
-    progress_markers = ["因此", "于是", "却", "但是", "最后", "必须", "冲突", "证据", "决定"]
-    novelty = _clamp(2.8 + _marker_score(text, surprise_markers) - _similarity_penalty(text, previous_text))
-    plot_progress = _clamp(2.8 + _marker_score(text, progress_markers))
+    progress_markers = ["因此", "于是", "却", "但是", "最后", "必须", "冲突", "证据", "决定", "质问", "阻止"]
+    repetition_penalty = _repetition_penalty(text)
+    artifact_penalty = _artifact_penalty(text)
+    similarity_penalty = _similarity_penalty(text, previous_text)
+    novelty = _clamp(2.7 + _marker_score(text, surprise_markers) - similarity_penalty - repetition_penalty)
+    plot_progress = _clamp(2.6 + _marker_score(text, progress_markers) - repetition_penalty)
 
     has_dialogue = bool(re.search(r"^[^。\n]{1,12}[：:]", text, flags=re.MULTILINE))
-    has_scene = "场" in text or "舞台说明" in text or "人物表" in text
-    overall = _clamp(2.8 + (0.45 if has_dialogue else 0) + (0.35 if has_scene else 0) + min(len(text) / 1200, 1.0) * 0.6)
+    has_scene = bool(re.search(r"第\s*[一二三四五六七八九十\d]+\s*场|【舞台说明】|人物表|分场大纲", text))
+    has_hook = "钩子" in text or "反转" in text or "结尾" in text
+    has_generic_role_label = "角色名：" in text or "speaker" in text.lower()
+    structure_bonus = (0.45 if has_dialogue else -0.45) + (0.35 if has_scene else -0.25) + (0.2 if has_hook else 0)
+    length_score = min(len(text) / 1400, 1.0) * 0.55
+    overall = _clamp(2.7 + structure_bonus + length_score - artifact_penalty - repetition_penalty)
 
-    contradiction_words = ["前后矛盾", "无法解释", "突然", "莫名其妙"]
-    logic = _clamp(4.0 - 0.35 * sum(1 for word in contradiction_words if word in text))
-    char_consistency = _clamp(3.7 + (0.3 if has_dialogue else 0))
+    contradiction_words = ["前后矛盾", "无法解释", "突然", "莫名其妙", "无缘无故", "没有原因"]
+    logic = _clamp(4.1 - 0.35 * sum(1 for word in contradiction_words if word in text) - repetition_penalty * 0.4)
+    speakers = _speakers(text)
+    speaker_bonus = 0.25 if 2 <= len(speakers) <= 5 else -0.2
+    char_consistency = _clamp(3.45 + (0.25 if has_dialogue else -0.25) + speaker_bonus - (0.35 if has_generic_role_label else 0))
+    comments = (
+        "rule_judge: readability-aware heuristic; "
+        f"terms={relevance_hits}, repetition_penalty={repetition_penalty:.2f}, artifact_penalty={artifact_penalty:.2f}."
+    )
 
     return JudgeScores(
         novelty=novelty,
@@ -54,26 +67,45 @@ def rule_judge(candidate: str, task_prompt: str = "", previous_text: str = "") -
         logic_consistency=logic,
         character_consistency=char_consistency,
         overall_quality=overall,
-        comments="rule_judge: lightweight heuristic scores for pipeline smoke testing.",
+        comments=comments,
     )
 
 
 def llm_judge(llm: LLM, candidate: str, task_prompt: str, previous_text: str = "", max_new_tokens: int = 512) -> JudgeScores:
-    prompt = f"""你是剧本生成实验的 judge。请只输出 JSON，不要解释。
+    prompt = build_llm_judge_prompt(candidate, task_prompt, previous_text)
+    raw = llm.generate(prompt, max_new_tokens=max_new_tokens, temperature=0.0).text
+    return parse_llm_judge_response(raw, candidate, task_prompt, previous_text)
 
-评分范围 1-5，字段必须包含：
-novelty, relevance, plot_progress, logic_consistency, character_consistency, overall_quality, comments。
+
+def build_llm_judge_prompt(candidate: str, task_prompt: str, previous_text: str = "") -> str:
+    return f"""你是剧本生成 pipeline 的严格评审器。只输出一行 JSON，不要 Markdown，不要解释。
+
+评分必须是 1 到 5 的数字，可以有一位小数。不要因为出现关键词就给高分，要惩罚：
+1. 助手口吻，如“当然可以”“以下是”“根据你的要求”。
+2. 重复对白、重复场景、原地解释。
+3. JSON/Markdown 说明文字混入最终剧本。
+4. 缺少对白、缺少场景动作、人物目标不清。
+
+JSON schema：
+{{"novelty":3.0,"relevance":3.0,"plot_progress":3.0,"logic_consistency":3.0,"character_consistency":3.0,"overall_quality":3.0,"comments":"20字以内中文短评"}}
 
 用户任务：
 {task_prompt}
 
 已有文本摘要：
-{previous_text[-1200:]}
+{previous_text[-1200:] or "无"}
 
 待评价候选：
 {candidate[-3000:]}
 """
-    raw = llm.generate(prompt, max_new_tokens=max_new_tokens, temperature=0.0).text
+
+
+def parse_llm_judge_response(
+    raw: str,
+    candidate: str,
+    task_prompt: str,
+    previous_text: str = "",
+) -> JudgeScores:
     data = _extract_json(raw)
     if not data:
         return rule_judge(candidate, task_prompt, previous_text)
@@ -140,6 +172,42 @@ def _similarity_penalty(text: str, previous_text: str) -> float:
         return 0.0
     jaccard = len(a & b) / len(a | b)
     return min(0.9, jaccard * 1.2)
+
+
+def _artifact_penalty(text: str) -> float:
+    artifacts = [
+        "当然可以",
+        "以下是",
+        "根据你的",
+        "我将",
+        "Stage",
+        "JSON",
+        "```",
+        "schema",
+        "任务卡",
+    ]
+    return min(1.2, sum(0.22 for artifact in artifacts if artifact in text))
+
+
+def _repetition_penalty(text: str) -> float:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 4:
+        return 0.0
+    duplicate_lines = len(lines) - len(set(lines))
+    line_penalty = min(0.8, duplicate_lines / max(len(lines), 1) * 1.8)
+    sentences = [part.strip() for part in re.split(r"[。！？!?]\s*", text) if len(part.strip()) >= 6]
+    duplicate_sentences = len(sentences) - len(set(sentences))
+    sentence_penalty = min(0.6, duplicate_sentences / max(len(sentences), 1) * 1.5)
+    return round(min(1.1, line_penalty + sentence_penalty), 2)
+
+
+def _speakers(text: str) -> set[str]:
+    names = set()
+    for match in re.finditer(r"^([^。\n：:【】]{1,12})[：:]", text, flags=re.MULTILINE):
+        name = match.group(1).strip()
+        if name and name not in {"地点", "时间", "场景", "角色名"}:
+            names.add(name)
+    return names
 
 
 def _clamp(value: float) -> float:
