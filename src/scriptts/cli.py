@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .data import read_jsonl, write_jsonl
 from .llm import HFLocalLLM, MockLLM
-from .pipeline import PipelineConfig, ScriptPipeline, save_result_markdown
+from .pipeline import PipelineConfig, ScriptPipeline, save_result_markdown, save_trace_markdown
 
 
 DEFAULT_MODEL_ROOT = "/data/fhy/models"
@@ -29,6 +29,7 @@ def main() -> None:
     config = PipelineConfig(
         max_branches=max_branches,
         min_branches=args.min_branches,
+        max_active_branches=args.max_active_branches,
         max_scenes=args.max_scenes,
         min_scenes=args.min_scenes,
         max_new_tokens=args.max_new_tokens,
@@ -41,6 +42,7 @@ def main() -> None:
     run_name = args.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir) / run_name
     scripts_dir = output_dir / "scripts"
+    traces_dir = output_dir / "traces"
     records = []
 
     print(f"[ScripTTS] selected_tasks={len(tasks)} output_dir={output_dir}")
@@ -49,6 +51,7 @@ def main() -> None:
         result = pipeline.run_task(task)
         records.append(result.record)
         save_result_markdown(scripts_dir / f"{result.task_id}.md", result)
+        save_trace_markdown(traces_dir / f"{result.task_id}.md", result)
         metrics = result.record["metrics"]
         score = result.record["final_score"]
         print(
@@ -60,6 +63,7 @@ def main() -> None:
     write_jsonl(output_dir / "results.jsonl", records)
     print(f"[ScripTTS] wrote {output_dir / 'results.jsonl'}")
     print(f"[ScripTTS] wrote scripts to {scripts_dir}")
+    print(f"[ScripTTS] wrote traces to {traces_dir}")
 
 
 def build_llm(args: argparse.Namespace):
@@ -104,9 +108,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16"], default="auto")
     parser.add_argument("--allow-remote-files", action="store_true", help="Allow transformers to fetch missing files.")
 
-    parser.add_argument("--judge-backend", choices=["rule", "llm"], default="rule")
+    parser.add_argument("--judge-backend", choices=["rule", "llm", "hybrid"], default="rule")
     parser.add_argument("--max-branches", type=int, default=2)
     parser.add_argument("--min-branches", type=int, default=3)
+    parser.add_argument("--max-active-branches", type=int, default=2)
     parser.add_argument("--max-scenes", type=int, default=4)
     parser.add_argument("--min-scenes", type=int, default=3)
     parser.add_argument("--max-new-tokens", type=int, default=768)

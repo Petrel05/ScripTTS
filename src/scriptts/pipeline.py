@@ -16,6 +16,7 @@ from .surprise import JudgeScores, build_llm_judge_prompt, parse_llm_judge_respo
 class PipelineConfig:
     max_branches: int = 2
     min_branches: int = 3
+    max_active_branches: int = 2
     max_scenes: int = 4
     min_scenes: int = 3
     max_new_tokens: int = 768
@@ -65,6 +66,47 @@ class PipelineResult:
     record: dict[str, Any]
 
 
+@dataclass
+class BranchState:
+    branch_id: int
+    parent_id: int | None = None
+    status: str = "active"
+    stage: str = "seed"
+    seed: str = ""
+    seed_data: dict[str, Any] | None = None
+    storyline: str = ""
+    storyline_data: dict[str, Any] | None = None
+    characters: str = ""
+    characters_data: dict[str, Any] | None = None
+    outline: str = ""
+    outline_data: dict[str, Any] | None = None
+    scene_goals: list[str] | None = None
+    scenes: list[dict[str, Any]] | None = None
+    scores: dict[str, dict[str, Any]] | None = None
+    decisions: list[dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        self.seed_data = self.seed_data or {}
+        self.storyline_data = self.storyline_data or {}
+        self.characters_data = self.characters_data or {}
+        self.outline_data = self.outline_data or {}
+        self.scene_goals = self.scene_goals or []
+        self.scenes = self.scenes or []
+        self.scores = self.scores or {}
+        self.decisions = self.decisions or []
+
+    def latest_score(self) -> dict[str, Any]:
+        if not self.scores:
+            return {}
+        for key in ["final", "scene", "outline", "characters", "storyline", "seed"]:
+            if key in self.scores:
+                return self.scores[key]
+        return {}
+
+    def generated_text(self) -> str:
+        return "\n\n".join(str(scene.get("text", "")) for scene in self.scenes or []).strip()
+
+
 class ScriptPipeline:
     def __init__(self, llm: LLM, config: PipelineConfig) -> None:
         self.llm = llm
@@ -90,121 +132,148 @@ class ScriptPipeline:
         task_card_data = _coerce_task_card(task, task_card_raw)
         task_card = _compact_json(task_card_data)
 
-        branch_records: list[dict[str, Any]] = []
-        best_branch: dict[str, Any] | None = None
+        controller_events: list[dict[str, Any]] = []
+        branches: list[BranchState] = []
         previous_seed = ""
-        recent_scores: list[JudgeScores] = []
-
-        for idx in range(self.config.max_branches):
-            seed_raw = call(_seed_prompt(task, task_card, idx + 1, previous_seed))
-            seed_data = _coerce_seed(seed_raw, idx + 1)
+        initial_count = min(max(self.config.min_branches, 1), self.config.max_branches)
+        for idx in range(1, initial_count + 1):
+            seed_raw = call(_seed_prompt(task, task_card, idx, previous_seed))
+            raw_outputs[f"branch_{idx}_seed"] = seed_raw
+            seed_data = _coerce_seed(seed_raw, idx)
             seed = _format_seed(seed_data)
             score = self._judge(seed, task.user_prompt, previous_seed, stats)
-            recent_scores.append(score)
+            branch = BranchState(branch_id=idx, seed=seed, seed_data=seed_data)
+            branch.scores["seed"] = score.to_dict()
             invalid, invalid_reason = _invalid_reason(score, stage="branch")
-            stop, reason = should_stop(recent_scores, min_rounds=1)
-            branch_stop, branch_reason = _should_stop_branch(recent_scores, self.config.min_branches)
-            if branch_stop:
-                stop = True
-                reason = branch_reason
-            if invalid:
-                decision = "reject"
-                reason = invalid_reason
-            else:
-                decision = "stop" if stop else "continue"
+            branch.status = "pruned" if invalid else "active"
+            branch.decisions.append(_decision_event("seed", "prune" if invalid else "keep", invalid_reason or "initial_branch", score.to_dict()))
+            branches.append(branch)
             stats.branch_count += 1
-            branch = {
-                "branch_id": idx + 1,
-                "raw_seed": seed_raw,
-                "seed_data": seed_data,
-                "seed": seed,
-                "seed_score": score.to_dict(),
-                "decision": decision,
-                "decision_reason": reason,
-            }
-            branch_records.append(branch)
-            if not invalid and (best_branch is None or score.overall_quality + score.useful_surprise > (
-                best_branch["score"].overall_quality + best_branch["score"].useful_surprise
-            )):
-                best_branch = {"seed": seed, "score": score, "data": seed_data}
             previous_seed += "\n" + seed
-            if stop and stats.branch_count >= self.config.min_branches:
-                stats.stopped_branch_count += 1
+            controller_events.append(_controller_event("INIT_BRANCH", branch.branch_id, "seed", branch.status, score.to_dict(), invalid_reason or "initial_seed"))
+
+        active = _controller_prune(branches, self.config.max_active_branches, controller_events, "seed")
+
+        for branch in list(active):
+            storyline_raw = call(_storyline_prompt(task, task_card, branch.seed))
+            raw_outputs[f"branch_{branch.branch_id}_storyline"] = storyline_raw
+            branch.storyline_data = _coerce_storyline(storyline_raw)
+            branch.storyline = _format_storyline(branch.storyline_data)
+            score = self._judge(branch.storyline, _branch_judge_context(task, branch, "storyline"), branch.seed, stats)
+            branch.scores["storyline"] = score.to_dict()
+            branch.stage = "storyline"
+            branch.decisions.append(_decision_event("storyline", "keep", "expanded_storyline", score.to_dict()))
+            controller_events.append(_controller_event("EXPAND_STORYLINE", branch.branch_id, "storyline", branch.status, score.to_dict(), "depth+1"))
+        active = _controller_prune(branches, self.config.max_active_branches, controller_events, "storyline")
+
+        for branch in list(active):
+            characters_raw = call(_character_prompt(task, task_card, branch.storyline))
+            raw_outputs[f"branch_{branch.branch_id}_characters"] = characters_raw
+            branch.characters_data = _coerce_characters(characters_raw)
+            branch.characters = _format_characters(branch.characters_data)
+            score = self._judge(branch.characters, _branch_judge_context(task, branch, "characters"), branch.storyline, stats)
+            branch.scores["characters"] = score.to_dict()
+            branch.stage = "characters"
+            branch.decisions.append(_decision_event("characters", "keep", "expanded_characters", score.to_dict()))
+            controller_events.append(_controller_event("EXPAND_CHARACTERS", branch.branch_id, "characters", branch.status, score.to_dict(), "depth+1"))
+        active = _controller_prune(branches, self.config.max_active_branches, controller_events, "characters")
+
+        for branch in list(active):
+            outline_raw = call(_outline_prompt(task, task_card, branch.storyline, branch.characters))
+            raw_outputs[f"branch_{branch.branch_id}_outline"] = outline_raw
+            branch.outline_data = _coerce_outline(outline_raw)
+            branch.outline = _format_outline(branch.outline_data)
+            branch.scene_goals = _extract_scene_goals(branch.outline, self.config.max_scenes, branch.outline_data)
+            score = self._judge(branch.outline, _branch_judge_context(task, branch, "outline"), branch.characters, stats)
+            branch.scores["outline"] = score.to_dict()
+            branch.stage = "outline"
+            branch.decisions.append(_decision_event("outline", "keep", "expanded_outline", score.to_dict()))
+            controller_events.append(_controller_event("EXPAND_OUTLINE", branch.branch_id, "outline", branch.status, score.to_dict(), "depth+1"))
+        active = _controller_prune(branches, self.config.max_active_branches, controller_events, "outline")
+
+        for scene_idx in range(1, self.config.max_scenes + 1):
+            scene_active = [branch for branch in active if branch.status == "active"]
+            if not scene_active:
                 break
+            for branch in scene_active:
+                if scene_idx > len(branch.scene_goals):
+                    branch.status = "completed"
+                    branch.decisions.append(_decision_event(f"scene_{scene_idx}", "complete", "no_more_scene_goals", branch.latest_score()))
+                    controller_events.append(_controller_event("COMPLETE_BRANCH", branch.branch_id, f"scene_{scene_idx}", branch.status, branch.latest_score(), "no_more_scene_goals"))
+                    continue
+                scene_goal = branch.scene_goals[scene_idx - 1]
+                generated_so_far = branch.generated_text()
+                scene_raw = call(
+                    _scene_prompt(
+                        task=task,
+                        task_card=task_card,
+                        storyline=branch.storyline,
+                        characters=branch.characters,
+                        outline=branch.outline,
+                        previous_text=generated_so_far,
+                        scene_idx=scene_idx,
+                        scene_goal=scene_goal,
+                    ),
+                    max_new_tokens=self.config.scene_max_new_tokens,
+                )
+                raw_outputs[f"branch_{branch.branch_id}_scene_{scene_idx}"] = scene_raw
+                scene_data = _coerce_scene(scene_raw, scene_idx, scene_goal, branch.characters_data)
+                scene_text = _format_scene(scene_data)
+                scene_judge_context = _scene_judge_context(task, scene_goal, branch.characters, branch.outline)
+                score = self._judge(scene_text, scene_judge_context, generated_so_far, stats)
+                score_dict = score.to_dict()
+                branch.scores["scene"] = score_dict
+                stop, reason = _branch_scene_stop(branch, score, scene_idx, self.config.min_scenes)
+                decision = "accept_and_stop" if stop else "accept"
+                branch.scenes.append(
+                    {
+                        "scene_id": scene_idx,
+                        "goal": scene_goal,
+                        "raw_text": scene_raw,
+                        "scene_data": scene_data,
+                        "text": scene_text,
+                        "score": score_dict,
+                        "decision": decision,
+                        "decision_reason": reason,
+                    }
+                )
+                branch.stage = f"scene_{scene_idx}"
+                if stop:
+                    branch.status = "completed"
+                    stats.stopped_scene_count += 1
+                branch.decisions.append(_decision_event(f"scene_{scene_idx}", decision, reason, score_dict))
+                controller_events.append(_controller_event("EXPAND_SCENE", branch.branch_id, f"scene_{scene_idx}", branch.status, score_dict, reason))
+            active = _controller_prune(branches, self.config.max_active_branches, controller_events, f"scene_{scene_idx}")
 
-        chosen_seed = str((best_branch or {"seed": branch_records[-1]["seed"]})["seed"])
-        storyline_raw = call(_storyline_prompt(task, task_card, chosen_seed))
-        raw_outputs["storyline"] = storyline_raw
-        storyline_data = _coerce_storyline(storyline_raw)
-        storyline = _format_storyline(storyline_data)
+        for branch in branches:
+            if branch.status == "active" and branch.scenes:
+                branch.status = "completed"
+                branch.decisions.append(_decision_event("max_depth", "complete", "reached_max_scenes", branch.latest_score()))
+                controller_events.append(_controller_event("COMPLETE_BRANCH", branch.branch_id, "max_depth", branch.status, branch.latest_score(), "reached_max_scenes"))
 
-        characters_raw = call(_character_prompt(task, task_card, storyline))
-        raw_outputs["characters"] = characters_raw
-        characters_data = _coerce_characters(characters_raw)
-        characters = _format_characters(characters_data)
+        candidates = [branch for branch in branches if branch.scenes and branch.status != "pruned"]
+        if not candidates:
+            candidates = [branch for branch in branches if branch.scenes] or branches
+        for branch in candidates:
+            final_text = _compose_final_script(task, branch.characters, branch.outline, branch.scenes)
+            final_score = self._final_judge(final_text, task.user_prompt, stats)
+            branch.scores["final"] = final_score.to_dict()
+            branch.decisions.append(_decision_event("final", "candidate", "final_judge", final_score.to_dict()))
+            controller_events.append(_controller_event("FINAL_JUDGE", branch.branch_id, "final", branch.status, final_score.to_dict(), "candidate"))
 
-        outline_raw = call(_outline_prompt(task, task_card, storyline, characters))
-        raw_outputs["outline"] = outline_raw
-        outline_data = _coerce_outline(outline_raw)
-        outline = _format_outline(outline_data)
-        scene_goals = _extract_scene_goals(outline, self.config.max_scenes, outline_data)
-
-        scenes: list[dict[str, Any]] = []
-        generated_so_far = ""
-        scene_scores: list[JudgeScores] = []
-        for scene_idx, scene_goal in enumerate(scene_goals, start=1):
-            scene_raw = call(
-                _scene_prompt(
-                    task=task,
-                    task_card=task_card,
-                    storyline=storyline,
-                    characters=characters,
-                    outline=outline,
-                    previous_text=generated_so_far,
-                    scene_idx=scene_idx,
-                    scene_goal=scene_goal,
-                ),
-                max_new_tokens=self.config.scene_max_new_tokens,
-            )
-            scene_data = _coerce_scene(scene_raw, scene_idx, scene_goal, characters_data)
-            scene_text = _format_scene(scene_data)
-            scene_judge_context = _scene_judge_context(task, scene_goal, characters, outline)
-            score = self._judge(scene_text, scene_judge_context, generated_so_far, stats)
-            scene_scores.append(score)
-            invalid, invalid_reason = _invalid_reason(score)
-            stop, reason = should_stop(scene_scores, min_rounds=1)
-            if scene_idx < self.config.min_scenes:
-                stop = False
-                if reason != "need_more_rounds":
-                    reason = f"min_scenes_{self.config.min_scenes}_not_reached"
-            decision = "accept"
-            if invalid:
-                decision = "accept_with_warning"
-                reason = invalid_reason
-                if scene_idx >= self.config.min_scenes and invalid_reason in {"low_logic_consistency", "low_overall_quality"}:
-                    decision = "accept_and_stop"
-                    stop = True
-            elif stop:
-                decision = "accept_and_stop"
-            scenes.append(
-                {
-                    "scene_id": scene_idx,
-                    "goal": scene_goal,
-                    "raw_text": scene_raw,
-                    "scene_data": scene_data,
-                    "text": scene_text,
-                    "score": score.to_dict(),
-                    "decision": decision,
-                    "decision_reason": reason,
-                }
-            )
-            generated_so_far = (generated_so_far + "\n\n" + scene_text).strip()
-            if stop:
-                stats.stopped_scene_count += 1
-                break
-
-        final_script = _compose_final_script(task, characters, outline, scenes)
-        final_score = self._judge(final_script, task.user_prompt, "", stats)
+        best_final_branch = max(candidates, key=_branch_rank)
+        final_script = _compose_final_script(task, best_final_branch.characters, best_final_branch.outline, best_final_branch.scenes)
+        final_score = JudgeScores(
+            novelty=float(best_final_branch.scores.get("final", {}).get("novelty", 3)),
+            relevance=float(best_final_branch.scores.get("final", {}).get("relevance", 3)),
+            plot_progress=float(best_final_branch.scores.get("final", {}).get("plot_progress", 3)),
+            logic_consistency=float(best_final_branch.scores.get("final", {}).get("logic_consistency", 3)),
+            character_consistency=float(best_final_branch.scores.get("final", {}).get("character_consistency", 3)),
+            overall_quality=float(best_final_branch.scores.get("final", {}).get("overall_quality", 3)),
+            comments=str(best_final_branch.scores.get("final", {}).get("comments", "selected_final")),
+        )
+        controller_events.append(_controller_event("SELECT_FINAL", best_final_branch.branch_id, "final", "selected", final_score.to_dict(), "best_rank"))
+        stats.stopped_branch_count = len([branch for branch in branches if branch.status == "pruned"])
         stats.wall_time = time.time() - started
 
         record = {
@@ -217,15 +286,17 @@ class ScriptPipeline:
             },
             "task_card": task_card,
             "task_card_data": task_card_data,
-            "branches": branch_records,
-            "chosen_seed": chosen_seed,
-            "storyline": storyline,
-            "storyline_data": storyline_data,
-            "characters": characters,
-            "characters_data": characters_data,
-            "outline": outline,
-            "outline_data": outline_data,
-            "scenes": scenes,
+            "branches": [_branch_to_record(branch) for branch in branches],
+            "controller_events": controller_events,
+            "selected_branch_id": best_final_branch.branch_id,
+            "chosen_seed": best_final_branch.seed,
+            "storyline": best_final_branch.storyline,
+            "storyline_data": best_final_branch.storyline_data,
+            "characters": best_final_branch.characters,
+            "characters_data": best_final_branch.characters_data,
+            "outline": best_final_branch.outline,
+            "outline_data": best_final_branch.outline_data,
+            "scenes": best_final_branch.scenes,
             "final_score": final_score.to_dict(),
             "metrics": stats.to_dict(),
             "raw_outputs": raw_outputs,
@@ -241,10 +312,307 @@ class ScriptPipeline:
             return parse_llm_judge_response(generation.text, candidate, task_prompt, previous_text)
         return rule_judge(candidate, task_prompt, previous_text)
 
+    def _final_judge(self, candidate: str, task_prompt: str, stats: PipelineStats) -> JudgeScores:
+        if self.config.judge_backend in {"llm", "hybrid"}:
+            prompt = build_llm_judge_prompt(candidate, task_prompt, "")
+            generation = self.llm.generate(prompt, max_new_tokens=512, temperature=0.0)
+            stats.add_generation(generation.input_tokens, generation.output_tokens)
+            stats.judge_calls += 1
+            return parse_llm_judge_response(generation.text, candidate, task_prompt, "")
+        return rule_judge(candidate, task_prompt, "")
+
+
+def _controller_prune(
+    branches: list[BranchState],
+    max_active: int,
+    controller_events: list[dict[str, Any]],
+    stage: str,
+) -> list[BranchState]:
+    active = [branch for branch in branches if branch.status == "active"]
+    active.sort(key=_branch_rank, reverse=True)
+    keep = active[:max_active]
+    prune = active[max_active:]
+    for branch in prune:
+        branch.status = "pruned"
+        score = branch.latest_score()
+        branch.decisions.append(_decision_event(stage, "prune", "controller_width_limit", score))
+        controller_events.append(_controller_event("PRUNE_BRANCH", branch.branch_id, stage, "pruned", score, "controller_width_limit"))
+    return keep
+
+
+def _branch_rank(branch: BranchState) -> float:
+    latest = branch.latest_score()
+    final_bonus = 0.4 if "final" in (branch.scores or {}) else 0.0
+    depth_bonus = min(len(branch.scenes or []), 4) * 0.08
+    diversity_bonus = _branch_diversity_bonus(branch)
+    return (
+        float(latest.get("overall_quality", 0)) * 0.45
+        + float(latest.get("useful_surprise", 0)) * 0.35
+        + float(latest.get("logic_consistency", 0)) * 0.12
+        + float(latest.get("character_consistency", 0)) * 0.08
+        + depth_bonus
+        + diversity_bonus
+        + final_bonus
+    )
+
+
+def _branch_diversity_bonus(branch: BranchState) -> float:
+    seed = branch.seed or ""
+    if any(word in seed for word in ["身份", "真人", "意识", "牺牲", "黑客", "漏洞", "诚信"]):
+        return 0.08
+    return 0.0
+
+
+def _branch_scene_stop(branch: BranchState, score: JudgeScores, scene_idx: int, min_scenes: int) -> tuple[bool, str]:
+    if scene_idx < min_scenes:
+        return False, f"min_scenes_{min_scenes}_not_reached"
+    invalid, invalid_reason = _invalid_reason(score)
+    if invalid_reason in {"low_logic_consistency", "low_overall_quality"}:
+        return True, invalid_reason
+    scene_scores = []
+    for scene in branch.scenes or []:
+        data = scene.get("score", {})
+        scene_scores.append(
+            JudgeScores(
+                novelty=float(data.get("novelty", 3)),
+                relevance=float(data.get("relevance", 3)),
+                plot_progress=float(data.get("plot_progress", 3)),
+                logic_consistency=float(data.get("logic_consistency", 3)),
+                character_consistency=float(data.get("character_consistency", 3)),
+                overall_quality=float(data.get("overall_quality", 3)),
+                comments=str(data.get("comments", "")),
+            )
+        )
+    scene_scores.append(score)
+    stop, reason = should_stop(scene_scores, min_rounds=1)
+    if stop:
+        return True, reason
+    if invalid:
+        return False, invalid_reason
+    return False, "continue"
+
+
+def _decision_event(stage: str, decision: str, reason: str, score: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "decision": decision,
+        "reason": reason,
+        "score": score,
+    }
+
+
+def _controller_event(
+    action: str,
+    branch_id: int,
+    stage: str,
+    status: str,
+    score: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "action": action,
+        "branch_id": branch_id,
+        "stage": stage,
+        "status": status,
+        "reason": reason,
+        "rank_score": round(
+            float(score.get("overall_quality", 0)) * 0.45
+            + float(score.get("useful_surprise", 0)) * 0.35
+            + float(score.get("logic_consistency", 0)) * 0.12
+            + float(score.get("character_consistency", 0)) * 0.08,
+            3,
+        ),
+        "score": score,
+    }
+
+
+def _branch_judge_context(task: ScriptTask, branch: BranchState, stage: str) -> str:
+    return f"""用户任务：{task.user_prompt}
+类型：{task.genre}
+主题：{task.theme}
+约束：{task.constraints}
+当前分支：{branch.seed}
+当前阶段：{stage}
+已有主线：{branch.storyline}
+人物表：{branch.characters}
+大纲：{branch.outline}
+"""
+
+
+def _branch_to_record(branch: BranchState) -> dict[str, Any]:
+    return {
+        "branch_id": branch.branch_id,
+        "parent_id": branch.parent_id,
+        "status": branch.status,
+        "stage": branch.stage,
+        "seed": branch.seed,
+        "seed_data": branch.seed_data,
+        "seed_score": (branch.scores or {}).get("seed", {}),
+        "storyline": branch.storyline,
+        "storyline_data": branch.storyline_data,
+        "characters": branch.characters,
+        "characters_data": branch.characters_data,
+        "outline": branch.outline,
+        "outline_data": branch.outline_data,
+        "scene_goals": branch.scene_goals,
+        "scenes": branch.scenes,
+        "scores": branch.scores,
+        "decisions": branch.decisions,
+        "rank": round(_branch_rank(branch), 3),
+    }
+
 
 def save_result_markdown(path: Path, result: PipelineResult) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(result.final_script, encoding="utf-8")
+
+
+def save_trace_markdown(path: Path, result: PipelineResult) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_compose_trace_markdown(result.record), encoding="utf-8")
+
+
+def _compose_trace_markdown(record: dict[str, Any]) -> str:
+    task = record.get("task", {})
+    metrics = record.get("metrics", {})
+    final_score = record.get("final_score", {})
+    lines = [
+        f"# Pipeline Trace: {task.get('id', '')}",
+        "",
+        "## Task",
+        f"- Genre: {task.get('genre', '')}",
+        f"- Theme: {task.get('theme', '')}",
+        f"- Prompt: {task.get('user_prompt', '')}",
+        f"- Constraints: {_one_line(task.get('constraints', {}), 500)}",
+        "",
+        "## Run Metrics",
+        f"- API calls: {metrics.get('api_calls', 0)}",
+        f"- Judge calls: {metrics.get('judge_calls', 0)}",
+        f"- Tokens: input={metrics.get('input_tokens', 0)}, output={metrics.get('output_tokens', 0)}, total={metrics.get('total_tokens', 0)}",
+        f"- Branches: generated={metrics.get('branch_count', 0)}, stopped={metrics.get('stopped_branch_count', 0)}",
+        f"- Scenes: generated={len(record.get('scenes', []))}, stopped={metrics.get('stopped_scene_count', 0)}",
+        f"- Wall time: {metrics.get('wall_time', 0)}s",
+        "",
+        "## Stage 0: Requirement Normalization",
+        "```json",
+        json.dumps(record.get("task_card_data", {}), ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## Stage 1: Seed Branching",
+    ]
+    for branch in record.get("branches", []):
+        score = branch.get("seed_score", {}) or branch.get("scores", {}).get("seed", {})
+        last_decision = (branch.get("decisions") or [{}])[-1]
+        lines.extend(
+            [
+                f"### Branch {branch.get('branch_id')}: {branch.get('status')} rank={branch.get('rank')}",
+                f"- Last decision: {last_decision.get('decision', '')} ({last_decision.get('reason', '')})",
+                _score_line(score),
+                f"- Idea: {_one_line(branch.get('seed_data', {}).get('idea') or branch.get('seed', ''), 300)}",
+                f"- Conflict: {_one_line(branch.get('seed_data', {}).get('core_conflict', ''), 300)}",
+                f"- Twist: {_one_line(branch.get('seed_data', {}).get('twist', ''), 300)}",
+                f"- Risk: {_one_line(branch.get('seed_data', {}).get('risk', ''), 300)}",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Controller Events",
+        ]
+    )
+    for event in record.get("controller_events", []):
+        score = event.get("score", {})
+        lines.append(
+            f"- {event.get('action')} b{event.get('branch_id')} @{event.get('stage')}: "
+            f"{event.get('status')} / {event.get('reason')} / rank={event.get('rank_score')} / "
+            f"surprise={score.get('useful_surprise')} overall={score.get('overall_quality')}"
+        )
+    lines.extend(
+        [
+            "",
+            "### Chosen Seed",
+            f"Selected branch: {record.get('selected_branch_id', '')}",
+            _one_line(record.get("chosen_seed", ""), 800),
+            "",
+            "## Stage 2: Storyline",
+            _clip_block(record.get("storyline", ""), 1600),
+            "",
+            "## Stage 3: Characters And Conflicts",
+            _clip_block(record.get("characters", ""), 1600),
+            "",
+            "## Stage 4: Scene Outline",
+            _clip_block(record.get("outline", ""), 2000),
+            "",
+            "## Stage 5: Scene Generation And Pruning",
+        ]
+    )
+    lines.extend(["", "## Branch Details"])
+    for branch in record.get("branches", []):
+        lines.extend(
+            [
+                f"### Branch {branch.get('branch_id')} ({branch.get('status')}, rank={branch.get('rank')})",
+                "#### Scores By Stage",
+            ]
+        )
+        for stage, score in (branch.get("scores") or {}).items():
+            lines.append(f"- {stage}: {_score_line(score).removeprefix('- Scores: ')}")
+        lines.append("#### Decisions")
+        for decision in branch.get("decisions") or []:
+            lines.append(f"- {decision.get('stage')}: {decision.get('decision')} ({decision.get('reason')})")
+        if branch.get("scenes"):
+            lines.append("#### Scenes")
+            for scene in branch.get("scenes", []):
+                score = scene.get("score", {})
+                lines.extend(
+                    [
+                        f"- Scene {scene.get('scene_id')}: {scene.get('decision')} ({scene.get('decision_reason')}); "
+                        f"surprise={score.get('useful_surprise')} overall={score.get('overall_quality')}",
+                        f"  Goal: {_one_line(scene.get('goal', ''), 300)}",
+                    ]
+                )
+        lines.append("")
+    lines.extend(["## Selected Branch Scenes"])
+    for scene in record.get("scenes", []):
+        score = scene.get("score", {})
+        lines.extend(
+            [
+                f"### Scene {scene.get('scene_id')}: {scene.get('decision')} ({scene.get('decision_reason')})",
+                _score_line(score),
+                f"- Goal: {_one_line(scene.get('goal', ''), 500)}",
+                "- Text:",
+                _clip_block(scene.get("text", ""), 1200),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Final Judge",
+            _score_line(final_score),
+            f"- Comments: {final_score.get('comments', '')}",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _score_line(score: dict[str, Any]) -> str:
+    return (
+        f"- Scores: useful_surprise={score.get('useful_surprise')}, "
+        f"novelty={score.get('novelty')}, relevance={score.get('relevance')}, "
+        f"plot={score.get('plot_progress')}, logic={score.get('logic_consistency')}, "
+        f"character={score.get('character_consistency')}, overall={score.get('overall_quality')}"
+    )
+
+
+def _one_line(value: Any, limit: int) -> str:
+    text = str(value).replace("\n", " ").strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+
+def _clip_block(value: Any, limit: int) -> str:
+    text = str(value).strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "\n..."
+    return text
 
 
 def _compact_json(data: dict[str, Any]) -> str:
