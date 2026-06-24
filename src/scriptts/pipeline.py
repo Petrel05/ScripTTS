@@ -15,6 +15,7 @@ from .surprise import JudgeScores, build_llm_judge_prompt, parse_llm_judge_respo
 @dataclass
 class PipelineConfig:
     max_branches: int = 2
+    min_branches: int = 3
     max_scenes: int = 4
     min_scenes: int = 3
     max_new_tokens: int = 768
@@ -102,7 +103,7 @@ class ScriptPipeline:
             recent_scores.append(score)
             invalid, invalid_reason = _invalid_reason(score, stage="branch")
             stop, reason = should_stop(recent_scores, min_rounds=1)
-            branch_stop, branch_reason = _should_stop_branch(recent_scores)
+            branch_stop, branch_reason = _should_stop_branch(recent_scores, self.config.min_branches)
             if branch_stop:
                 stop = True
                 reason = branch_reason
@@ -127,7 +128,7 @@ class ScriptPipeline:
             )):
                 best_branch = {"seed": seed, "score": score, "data": seed_data}
             previous_seed += "\n" + seed
-            if stop:
+            if stop and stats.branch_count >= self.config.min_branches:
                 stats.stopped_branch_count += 1
                 break
 
@@ -167,7 +168,8 @@ class ScriptPipeline:
             )
             scene_data = _coerce_scene(scene_raw, scene_idx, scene_goal, characters_data)
             scene_text = _format_scene(scene_data)
-            score = self._judge(scene_text, task.user_prompt, generated_so_far, stats)
+            scene_judge_context = _scene_judge_context(task, scene_goal, characters, outline)
+            score = self._judge(scene_text, scene_judge_context, generated_so_far, stats)
             scene_scores.append(score)
             invalid, invalid_reason = _invalid_reason(score)
             stop, reason = should_stop(scene_scores, min_rounds=1)
@@ -179,7 +181,7 @@ class ScriptPipeline:
             if invalid:
                 decision = "accept_with_warning"
                 reason = invalid_reason
-                if scene_idx >= self.config.min_scenes:
+                if scene_idx >= self.config.min_scenes and invalid_reason in {"low_logic_consistency", "low_overall_quality"}:
                     decision = "accept_and_stop"
                     stop = True
             elif stop:
@@ -411,7 +413,12 @@ def _coerce_outline(raw: str) -> dict[str, Any]:
             elif isinstance(item, str):
                 parsed_scenes.append({"scene_id": idx, "title": f"第{idx}场", "location": "", "event": item, "conflict": "", "reveal": "", "hook": ""})
     if not parsed_scenes:
-        parsed_scenes = _parse_outline_lines(_clean_model_text(raw))
+        fallback_text = _clean_model_text(raw)
+        if '"scenes"' in raw or '{"scenes"' in raw:
+            fallback_text = ""
+        parsed_scenes = _parse_outline_lines(fallback_text)
+    if not parsed_scenes:
+        parsed_scenes = _default_outline_scenes()
     return {"scenes": parsed_scenes[:5]}
 
 
@@ -440,6 +447,12 @@ def _coerce_scene(raw: str, scene_idx: int, scene_goal: str, characters_data: di
             if isinstance(item, dict):
                 speaker = str(item.get("speaker") or item.get("角色") or "").strip()
                 line = str(item.get("line") or item.get("台词") or "").strip()
+                embedded = re.match(r"^([^。\n：:【】]{1,12})[：:]\s*(.+)$", line)
+                if embedded:
+                    embedded_speaker, embedded_line = embedded.groups()
+                    if not speaker or speaker != embedded_speaker:
+                        speaker = embedded_speaker.strip()
+                        line = embedded_line.strip()
                 if not speaker and line and fallback_speakers:
                     speaker = fallback_speakers[idx % len(fallback_speakers)]
                 if speaker and line:
@@ -503,8 +516,8 @@ def _invalid_reason(score: JudgeScores, stage: str = "text") -> tuple[bool, str]
     return False, ""
 
 
-def _should_stop_branch(scores: list[JudgeScores]) -> tuple[bool, str]:
-    if len(scores) < 2:
+def _should_stop_branch(scores: list[JudgeScores], min_branches: int) -> tuple[bool, str]:
+    if len(scores) < max(2, min_branches):
         return False, "need_more_rounds"
     prev = scores[-2]
     cur = scores[-1]
@@ -513,6 +526,17 @@ def _should_stop_branch(scores: list[JudgeScores]) -> tuple[bool, str]:
     if cur.useful_surprise < 3.15 and surprise_gain < 0.05 and quality_gain < 0.1:
         return True, "branch_low_surprise_gain"
     return False, "continue"
+
+
+def _scene_judge_context(task: ScriptTask, scene_goal: str, characters: str, outline: str) -> str:
+    return f"""用户任务：{task.user_prompt}
+类型：{task.genre}
+主题：{task.theme}
+约束：{task.constraints}
+当前场目标：{scene_goal}
+人物表：{characters}
+完整大纲：{outline}
+"""
 
 
 def _clean_model_text(text: str) -> str:
@@ -606,6 +630,38 @@ def _parse_outline_lines(text: str) -> list[dict[str, Any]]:
         chunks = [chunk.strip() for chunk in re.split(r"[。；;]\s*", text) if len(chunk.strip()) >= 8]
         scenes = [{"scene_id": idx, "title": f"第{idx}场", "location": "", "event": chunk, "conflict": "", "reveal": "", "hook": ""} for idx, chunk in enumerate(chunks[:5], start=1)]
     return scenes
+
+
+def _default_outline_scenes() -> list[dict[str, Any]]:
+    return [
+        {
+            "scene_id": 1,
+            "title": "异常出现",
+            "location": "校园教室 / 白天",
+            "event": "AI助教出现异常行为，引发学生和老师的怀疑",
+            "conflict": "学生依赖AI，老师担心AI失控",
+            "reveal": "AI助教开始表现出超出程序的判断",
+            "hook": "AI助教说出不该知道的信息",
+        },
+        {
+            "scene_id": 2,
+            "title": "冲突升级",
+            "location": "校园实验室 / 下午",
+            "event": "师生调查AI助教异常，发现它在隐瞒关键记录",
+            "conflict": "关闭AI还是继续追查真相",
+            "reveal": "异常与学生被保护的秘密有关",
+            "hook": "系统日志指向一个被删除的名字",
+        },
+        {
+            "scene_id": 3,
+            "title": "反转揭示",
+            "location": "教室 / 夜晚",
+            "event": "AI助教揭示失控行为背后的真正目的",
+            "conflict": "公开真相还是保护当事人",
+            "reveal": "AI并未失控，而是在执行保护协议",
+            "hook": "师生重新理解AI与教育的关系",
+        },
+    ]
 
 
 def _parse_dialogue_lines(text: str) -> list[dict[str, str]]:

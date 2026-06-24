@@ -30,34 +30,59 @@ class JudgeScores:
 
 def rule_judge(candidate: str, task_prompt: str = "", previous_text: str = "") -> JudgeScores:
     text = candidate.strip()
-    prompt_terms = _content_terms(task_prompt)
+    prompt_terms = _content_terms(task_prompt, limit=24)
     relevance_hits = sum(1 for term in prompt_terms if term in text)
-    relevance = _clamp(2.4 + min(relevance_hits, 6) * 0.35)
+    relevance_ratio = relevance_hits / max(len(prompt_terms), 1)
+    required_hits = _required_concept_hits(text, task_prompt)
+    scene_goal_hit = _scene_goal_score(text, task_prompt)
+    relevance = _clamp(2.15 + relevance_ratio * 1.35 + required_hits * 0.28 + scene_goal_hit * 0.55)
 
-    surprise_markers = ["反转", "转折", "真相", "误会", "秘密", "异常", "发现", "揭示", "选择"]
-    progress_markers = ["因此", "于是", "却", "但是", "最后", "必须", "冲突", "证据", "决定", "质问", "阻止"]
+    surprise_markers = ["反转", "转折", "真相", "误会", "秘密", "异常", "发现", "揭示", "选择", "坦白", "牺牲", "觉醒"]
+    progress_markers = ["因此", "于是", "却", "但是", "最后", "必须", "冲突", "证据", "决定", "质问", "阻止", "调查", "承认", "关闭"]
     repetition_penalty = _repetition_penalty(text)
     artifact_penalty = _artifact_penalty(text)
     similarity_penalty = _similarity_penalty(text, previous_text)
-    novelty = _clamp(2.7 + _marker_score(text, surprise_markers) - similarity_penalty - repetition_penalty)
-    plot_progress = _clamp(2.6 + _marker_score(text, progress_markers) - repetition_penalty)
+    event_density = _event_density(text)
+    novelty = _clamp(2.55 + _marker_score(text, surprise_markers) + event_density * 0.35 - similarity_penalty - repetition_penalty)
+    plot_progress = _clamp(2.35 + _marker_score(text, progress_markers) + event_density * 0.65 - repetition_penalty)
 
     has_dialogue = bool(re.search(r"^[^。\n]{1,12}[：:]", text, flags=re.MULTILINE))
     has_scene = bool(re.search(r"第\s*[一二三四五六七八九十\d]+\s*场|【舞台说明】|人物表|分场大纲", text))
     has_hook = "钩子" in text or "反转" in text or "结尾" in text
     has_generic_role_label = "角色名：" in text or "speaker" in text.lower()
-    structure_bonus = (0.45 if has_dialogue else -0.45) + (0.35 if has_scene else -0.25) + (0.2 if has_hook else 0)
+    dialogue_count = _dialogue_count(text)
+    action_score = _action_score(text)
+    structure_bonus = (
+        (0.35 if has_dialogue else -0.45)
+        + (0.3 if has_scene else -0.25)
+        + (0.18 if has_hook else 0)
+        + min(dialogue_count, 8) * 0.035
+        + action_score * 0.18
+    )
     length_score = min(len(text) / 1400, 1.0) * 0.55
     overall = _clamp(2.7 + structure_bonus + length_score - artifact_penalty - repetition_penalty)
 
-    contradiction_words = ["前后矛盾", "无法解释", "突然", "莫名其妙", "无缘无故", "没有原因"]
-    logic = _clamp(4.1 - 0.35 * sum(1 for word in contradiction_words if word in text) - repetition_penalty * 0.4)
+    contradiction_words = ["前后矛盾", "无法解释", "突然", "莫名其妙", "无缘无故", "没有原因", "毫无理由"]
+    unresolved_words = ["这道题的解法是……", "等等", "某种", "什么东西"]
+    logic = _clamp(
+        4.05
+        - 0.35 * sum(1 for word in contradiction_words if word in text)
+        - 0.18 * sum(1 for word in unresolved_words if word in text)
+        - repetition_penalty * 0.4
+    )
     speakers = _speakers(text)
     speaker_bonus = 0.25 if 2 <= len(speakers) <= 5 else -0.2
-    char_consistency = _clamp(3.45 + (0.25 if has_dialogue else -0.25) + speaker_bonus - (0.35 if has_generic_role_label else 0))
+    char_consistency = _clamp(
+        3.35
+        + (0.25 if has_dialogue else -0.25)
+        + speaker_bonus
+        + min(dialogue_count, 8) * 0.025
+        - (0.35 if has_generic_role_label else 0)
+    )
     comments = (
-        "rule_judge: readability-aware heuristic; "
-        f"terms={relevance_hits}, repetition_penalty={repetition_penalty:.2f}, artifact_penalty={artifact_penalty:.2f}."
+        "rule_judge_v2: "
+        f"rel_hits={relevance_hits}/{len(prompt_terms)}, concepts={required_hits}, goal={scene_goal_hit:.2f}, "
+        f"events={event_density:.2f}, dialogue={dialogue_count}, repeat={repetition_penalty:.2f}, artifact={artifact_penalty:.2f}."
     )
 
     return JudgeScores(
@@ -85,6 +110,7 @@ def build_llm_judge_prompt(candidate: str, task_prompt: str, previous_text: str 
 2. 重复对白、重复场景、原地解释。
 3. JSON/Markdown 说明文字混入最终剧本。
 4. 缺少对白、缺少场景动作、人物目标不清。
+5. 当前场目标没有完成，或对完整大纲没有贡献。
 
 JSON schema：
 {{"novelty":3.0,"relevance":3.0,"plot_progress":3.0,"logic_consistency":3.0,"character_consistency":3.0,"overall_quality":3.0,"comments":"20字以内中文短评"}}
@@ -147,15 +173,30 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _content_terms(text: str) -> list[str]:
+def _content_terms(text: str, limit: int = 12) -> list[str]:
     terms = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9_-]{2,}", text)
-    stop = {"要求", "主题", "一个", "人物", "结尾", "短剧", "剧本", "需要", "output", "format"}
+    stop = {
+        "要求",
+        "主题",
+        "一个",
+        "人物",
+        "结尾",
+        "短剧",
+        "剧本",
+        "需要",
+        "用户任务",
+        "当前场目标",
+        "人物表",
+        "完整大纲",
+        "output",
+        "format",
+    }
     seen: list[str] = []
     for term in terms:
         if term in stop or term in seen:
             continue
         seen.append(term)
-    return seen[:12]
+    return seen[:limit]
 
 
 def _marker_score(text: str, markers: list[str]) -> float:
@@ -172,6 +213,45 @@ def _similarity_penalty(text: str, previous_text: str) -> float:
         return 0.0
     jaccard = len(a & b) / len(a | b)
     return min(0.9, jaccard * 1.2)
+
+
+def _required_concept_hits(text: str, task_prompt: str) -> int:
+    concepts = []
+    for concept in ["校园", "AI", "助教", "师生", "冲突", "反转", "学生", "老师", "科幻"]:
+        if concept in task_prompt:
+            concepts.append(concept)
+    return sum(1 for concept in concepts if concept in text)
+
+
+def _scene_goal_score(text: str, task_prompt: str) -> float:
+    goal = ""
+    for line in task_prompt.splitlines():
+        if line.startswith("当前场目标：") or line.startswith("当前场目标:"):
+            goal = line.split("：", 1)[-1] if "：" in line else line.split(":", 1)[-1]
+            break
+    if not goal:
+        return 0.0
+    goal_terms = _content_terms(goal, limit=10)
+    if not goal_terms:
+        return 0.0
+    hits = sum(1 for term in goal_terms if term in text)
+    return hits / len(goal_terms)
+
+
+def _event_density(text: str) -> float:
+    event_words = ["发现", "调查", "阻止", "关闭", "承认", "坦白", "修改", "牺牲", "揭示", "冲进", "试图", "选择", "质问"]
+    hits = sum(1 for word in event_words if word in text)
+    return min(1.0, hits / 5)
+
+
+def _dialogue_count(text: str) -> int:
+    return len(re.findall(r"^[^。\n：:【】]{1,12}[：:]", text, flags=re.MULTILINE))
+
+
+def _action_score(text: str) -> float:
+    action_words = ["站", "走", "冲", "拿", "看", "敲", "停顿", "闪烁", "响起", "关", "打开", "投影", "屏幕", "警报"]
+    hits = sum(1 for word in action_words if word in text)
+    return min(1.0, hits / 5)
 
 
 def _artifact_penalty(text: str) -> float:

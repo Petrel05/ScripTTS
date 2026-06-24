@@ -25,8 +25,10 @@ def main() -> None:
         raise SystemExit("No tasks selected.")
 
     llm = build_llm(args)
+    max_branches = max(args.max_branches, args.min_branches)
     config = PipelineConfig(
-        max_branches=args.max_branches,
+        max_branches=max_branches,
+        min_branches=args.min_branches,
         max_scenes=args.max_scenes,
         min_scenes=args.min_scenes,
         max_new_tokens=args.max_new_tokens,
@@ -104,6 +106,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--judge-backend", choices=["rule", "llm"], default="rule")
     parser.add_argument("--max-branches", type=int, default=2)
+    parser.add_argument("--min-branches", type=int, default=3)
     parser.add_argument("--max-scenes", type=int, default=4)
     parser.add_argument("--min-scenes", type=int, default=3)
     parser.add_argument("--max-new-tokens", type=int, default=768)
