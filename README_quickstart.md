@@ -56,12 +56,12 @@ outputs/smoke_mock/scripts/script_001.md
 /data/fhy/models/Qwen3-8B
 ```
 
-安装基础依赖：
+创建 conda 环境并安装基础依赖：
 
 ```bash
 cd /home/fhy/ScripTTS
-python3 -m venv .venv
-source .venv/bin/activate
+conda create -n scriptts python=3.10 -y
+conda activate scriptts
 pip install torch transformers accelerate
 ```
 
