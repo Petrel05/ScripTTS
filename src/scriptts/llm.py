@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import log
 from typing import Protocol
 
 
@@ -11,6 +12,7 @@ class Generation:
     text: str
     input_tokens: int
     output_tokens: int
+    diagnostics: dict[str, float] = field(default_factory=dict)
 
 
 class LLM(Protocol):
@@ -34,6 +36,7 @@ class MockLLM:
             text=text,
             input_tokens=rough_token_count(prompt),
             output_tokens=rough_token_count(text),
+            diagnostics={"mock_entropy": 0.0},
         )
 
     def _mock_text(self, prompt: str) -> str:
@@ -140,6 +143,7 @@ class HFLocalLLM:
         dtype: str = "auto",
         local_files_only: bool = True,
         trust_remote_code: bool = True,
+        collect_token_stats: bool = False,
     ) -> None:
         try:
             import torch
@@ -170,6 +174,7 @@ class HFLocalLLM:
             self.model.to("cuda")
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.collect_token_stats = collect_token_stats
 
     def generate(self, prompt: str, max_new_tokens: int = 768, temperature: float = 0.7) -> Generation:
         import torch
@@ -205,8 +210,33 @@ class HFLocalLLM:
         if do_sample:
             generate_kwargs["temperature"] = max(temperature, 1e-5)
             generate_kwargs["top_p"] = 0.9
+        if self.collect_token_stats:
+            generate_kwargs["return_dict_in_generate"] = True
+            generate_kwargs["output_scores"] = True
         with torch.no_grad():
-            output_ids = self.model.generate(**generate_kwargs)
+            outputs = self.model.generate(**generate_kwargs)
+        output_ids = outputs.sequences if self.collect_token_stats else outputs
         new_ids = output_ids[0][inputs["input_ids"].shape[-1] :]
         text = self.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-        return Generation(text=text, input_tokens=int(inputs["input_ids"].numel()), output_tokens=int(new_ids.numel()))
+        diagnostics = {}
+        if self.collect_token_stats and getattr(outputs, "scores", None):
+            entropies = []
+            top1_probs = []
+            for logits in outputs.scores:
+                probs = torch.softmax(logits[0].float(), dim=-1)
+                entropy = float(-(probs * torch.log(probs.clamp_min(1e-12))).sum().item() / log(2))
+                entropies.append(entropy)
+                top1_probs.append(float(probs.max().item()))
+            if entropies:
+                diagnostics = {
+                    "token_entropy_mean_bits": round(sum(entropies) / len(entropies), 4),
+                    "token_entropy_max_bits": round(max(entropies), 4),
+                    "token_entropy_min_bits": round(min(entropies), 4),
+                    "token_top1_prob_mean": round(sum(top1_probs) / len(top1_probs), 4),
+                }
+        return Generation(
+            text=text,
+            input_tokens=int(inputs["input_ids"].numel()),
+            output_tokens=int(new_ids.numel()),
+            diagnostics=diagnostics,
+        )

@@ -43,8 +43,27 @@ def rule_judge(candidate: str, task_prompt: str = "", previous_text: str = "") -
     artifact_penalty = _artifact_penalty(text)
     similarity_penalty = _similarity_penalty(text, previous_text)
     event_density = _event_density(text)
-    novelty = _clamp(2.55 + _marker_score(text, surprise_markers) + event_density * 0.35 - similarity_penalty - repetition_penalty)
-    plot_progress = _clamp(2.35 + _marker_score(text, progress_markers) + event_density * 0.65 - repetition_penalty)
+    twist_strength = _twist_strength(text)
+    payoff_strength = _payoff_strength(text)
+    causal_score = _causal_score(text)
+    premise_penalty, premise_flags = _premise_flaw_penalty(text, task_prompt)
+    novelty = _clamp(
+        2.45
+        + _marker_score(text, surprise_markers)
+        + event_density * 0.25
+        + twist_strength * 0.45
+        - similarity_penalty
+        - repetition_penalty
+    )
+    plot_progress = _clamp(
+        2.25
+        + _marker_score(text, progress_markers)
+        + event_density * 0.45
+        + causal_score * 0.35
+        + payoff_strength * 0.25
+        - repetition_penalty
+        - premise_penalty * 0.35
+    )
 
     has_dialogue = bool(re.search(r"^[^。\n]{1,12}[：:]", text, flags=re.MULTILINE))
     has_scene = bool(re.search(r"第\s*[一二三四五六七八九十\d]+\s*场|【舞台说明】|人物表|分场大纲", text))
@@ -58,9 +77,10 @@ def rule_judge(candidate: str, task_prompt: str = "", previous_text: str = "") -
         + (0.18 if has_hook else 0)
         + min(dialogue_count, 8) * 0.035
         + action_score * 0.18
+        + payoff_strength * 0.12
     )
     length_score = min(len(text) / 1400, 1.0) * 0.55
-    overall = _clamp(2.7 + structure_bonus + length_score - artifact_penalty - repetition_penalty)
+    overall = _clamp(2.7 + structure_bonus + length_score - artifact_penalty - repetition_penalty - premise_penalty * 0.45)
 
     contradiction_words = ["前后矛盾", "无法解释", "突然", "莫名其妙", "无缘无故", "没有原因", "毫无理由"]
     unresolved_words = ["这道题的解法是……", "等等", "某种", "什么东西"]
@@ -69,6 +89,7 @@ def rule_judge(candidate: str, task_prompt: str = "", previous_text: str = "") -
         - 0.35 * sum(1 for word in contradiction_words if word in text)
         - 0.18 * sum(1 for word in unresolved_words if word in text)
         - repetition_penalty * 0.4
+        - premise_penalty * 0.95
     )
     speakers = _speakers(text)
     speaker_bonus = 0.25 if 2 <= len(speakers) <= 5 else -0.2
@@ -82,7 +103,9 @@ def rule_judge(candidate: str, task_prompt: str = "", previous_text: str = "") -
     comments = (
         "rule_judge_v2: "
         f"rel_hits={relevance_hits}/{len(prompt_terms)}, concepts={required_hits}, goal={scene_goal_hit:.2f}, "
-        f"events={event_density:.2f}, dialogue={dialogue_count}, repeat={repetition_penalty:.2f}, artifact={artifact_penalty:.2f}."
+        f"events={event_density:.2f}, twist={twist_strength:.2f}, payoff={payoff_strength:.2f}, causal={causal_score:.2f}, "
+        f"premise={premise_penalty:.2f}:{','.join(premise_flags) or 'ok'}, "
+        f"dialogue={dialogue_count}, repeat={repetition_penalty:.2f}, artifact={artifact_penalty:.2f}."
     )
 
     return JudgeScores(
@@ -109,8 +132,12 @@ def build_llm_judge_prompt(candidate: str, task_prompt: str, previous_text: str 
 1. 助手口吻，如“当然可以”“以下是”“根据你的要求”。
 2. 重复对白、重复场景、原地解释。
 3. JSON/Markdown 说明文字混入最终剧本。
-4. 缺少对白、缺少场景动作、人物目标不清。
+4. 缺少对白、缺少场景动作、人物目标不清；但不要因为有非对白动作段落而扣分，动作只要推动冲突或揭示信息就是有效剧本内容。
 5. 当前场目标没有完成，或对完整大纲没有贡献。
+6. 核心冲突前提不成立：例如 AI 助教会讲题、知道答案、答题快，本身不等于作弊；必须有泄题、篡改成绩、替考、违规获取试题、操控考试等具体违规行为。
+7. 反转动机没有因果支撑：例如“为了保护学校声誉/掩盖丑闻”不能单独成立，必须解释谁受益、为什么必须这样做、前文如何铺垫。
+8. 如果核心冲突不成立，logic_consistency 和 overall_quality 最高只能给 2.5；如果结尾反转无因果铺垫，logic_consistency 最高只能给 3.0。
+9. 如果最终剧本没有写到大纲最后一场，或停在“等待最终抉择”的钩子而没有完成反转/收束，plot_progress 和 overall_quality 最高只能给 3.0。
 
 JSON schema：
 {{"novelty":3.0,"relevance":3.0,"plot_progress":3.0,"logic_consistency":3.0,"character_consistency":3.0,"overall_quality":3.0,"comments":"20字以内中文短评"}}
@@ -135,15 +162,55 @@ def parse_llm_judge_response(
     data = _extract_json(raw)
     if not data:
         return rule_judge(candidate, task_prompt, previous_text)
-    return JudgeScores(
-        novelty=_clamp(float(data.get("novelty", 3))),
-        relevance=_clamp(float(data.get("relevance", 3))),
-        plot_progress=_clamp(float(data.get("plot_progress", data.get("plotProgress", 3)))),
-        logic_consistency=_clamp(float(data.get("logic_consistency", data.get("logicConsistency", 3)))),
-        character_consistency=_clamp(float(data.get("character_consistency", data.get("characterConsistency", 3)))),
-        overall_quality=_clamp(float(data.get("overall_quality", data.get("overallQuality", 3)))),
+    score = JudgeScores(
+        novelty=_score_value(data, "novelty", 3),
+        relevance=_score_value(data, "relevance", 3),
+        plot_progress=_score_value(data, "plot_progress", 3, alias="plotProgress"),
+        logic_consistency=_score_value(data, "logic_consistency", 3, alias="logicConsistency"),
+        character_consistency=_score_value(data, "character_consistency", 3, alias="characterConsistency"),
+        overall_quality=_score_value(data, "overall_quality", 3, alias="overallQuality"),
         comments=str(data.get("comments", "llm_judge")),
     )
+    return _calibrate_llm_score(score, candidate, task_prompt, previous_text)
+
+
+def _score_value(data: dict[str, Any], key: str, default: float, alias: str = "") -> float:
+    value = data.get(key, data.get(alias, default)) if alias else data.get(key, default)
+    try:
+        return _clamp(float(value))
+    except (TypeError, ValueError):
+        return _clamp(default)
+
+
+def _calibrate_llm_score(score: JudgeScores, candidate: str, task_prompt: str, previous_text: str) -> JudgeScores:
+    rule_score = rule_judge(candidate, task_prompt, previous_text)
+    premise_flags = _premise_flags_from_comments(rule_score.comments)
+    if premise_flags:
+        score.logic_consistency = min(score.logic_consistency, 2.5)
+        score.overall_quality = min(score.overall_quality, 2.5)
+        score.plot_progress = min(score.plot_progress, 3.0)
+        score.comments = _merge_comments(score.comments, f"rule_veto:{','.join(premise_flags)}")
+    elif rule_score.logic_consistency < 3.1 and score.logic_consistency > 3.1:
+        score.logic_consistency = min(score.logic_consistency, 3.1)
+        score.comments = _merge_comments(score.comments, "rule_warn:low_logic")
+    return score
+
+
+def _premise_flags_from_comments(comments: str) -> list[str]:
+    flags = []
+    for flag in [
+        "ai_tutor_cheating_premise",
+        "cheating_without_wrongdoing",
+        "unsupported_reputation_motive",
+    ]:
+        if flag in comments:
+            flags.append(flag)
+    return flags
+
+
+def _merge_comments(primary: str, secondary: str, limit: int = 120) -> str:
+    merged = f"{primary}; {secondary}" if primary else secondary
+    return merged[:limit]
 
 
 def should_stop(recent_scores: list[JudgeScores], min_rounds: int = 2) -> tuple[bool, str]:
@@ -242,6 +309,107 @@ def _event_density(text: str) -> float:
     event_words = ["发现", "调查", "阻止", "关闭", "承认", "坦白", "修改", "牺牲", "揭示", "冲进", "试图", "选择", "质问"]
     hits = sum(1 for word in event_words if word in text)
     return min(1.0, hits / 5)
+
+
+def _twist_strength(text: str) -> float:
+    markers = ["其实", "原来", "并非", "不是", "而是", "真相", "身份", "隐藏", "反转", "觉醒", "牺牲"]
+    hits = sum(1 for marker in markers if marker in text)
+    contrast = 1 if re.search(r"不是.+而是|并非.+而是|看似.+实则|以为.+其实", text, flags=re.DOTALL) else 0
+    late_reveal = 0
+    if len(text) > 200:
+        tail = text[int(len(text) * 0.55):]
+        late_reveal = 1 if any(marker in tail for marker in ["真相", "原来", "其实", "反转", "身份", "牺牲"]) else 0
+    return min(1.0, hits / 6 + contrast * 0.25 + late_reveal * 0.2)
+
+
+def _payoff_strength(text: str) -> float:
+    hook_count = text.count("钩子") + text.count("伏笔")
+    reveal_count = sum(text.count(word) for word in ["揭示", "真相", "回收", "原来", "最终", "最后"])
+    has_setup_payoff = 1 if hook_count and reveal_count else 0
+    return min(1.0, hook_count * 0.12 + reveal_count * 0.10 + has_setup_payoff * 0.25)
+
+
+def _causal_score(text: str) -> float:
+    causal_words = ["因为", "所以", "因此", "导致", "为了", "如果", "否则", "于是", "最终", "选择"]
+    hits = sum(1 for word in causal_words if word in text)
+    return min(1.0, hits / 6)
+
+
+def _premise_flaw_penalty(text: str, task_prompt: str) -> tuple[float, list[str]]:
+    penalty = 0.0
+    flags: list[str] = []
+
+    cheating_terms = ["作弊", "舞弊", "违规", "考试诚信", "学术诚信"]
+    ai_tutor_terms = ["AI助教", "AI 助教", "智能助教", "助教AI", "助教"]
+    weak_accusation_terms = ["知道答案", "答得太快", "答题太快", "解题太快", "讲题", "给答案", "标准答案", "满分"]
+    concrete_wrongdoing_terms = [
+        "泄题",
+        "泄露试题",
+        "篡改成绩",
+        "修改成绩",
+        "伪造成绩",
+        "替考",
+        "代考",
+        "侵入系统",
+        "入侵系统",
+        "操控考试",
+        "违规获取",
+        "窃取试题",
+        "提前拿到试卷",
+        "删除记录",
+        "伪造记录",
+    ]
+
+    if _has_any(text, cheating_terms) and _has_any(text, ai_tutor_terms):
+        has_weak_accusation = _has_any(text, weak_accusation_terms)
+        has_wrongdoing = _has_any(text, concrete_wrongdoing_terms)
+        if has_weak_accusation and not has_wrongdoing:
+            penalty += 1.45
+            flags.append("ai_tutor_cheating_premise")
+        elif not has_wrongdoing:
+            penalty += 0.85
+            flags.append("cheating_without_wrongdoing")
+
+    reputation_terms = ["保护学校声誉", "维护学校声誉", "维护学校利益", "保住学校声誉", "掩盖丑闻", "学校声誉"]
+    motivation_support_terms = [
+        "董事会",
+        "经费",
+        "问责",
+        "处分",
+        "停办",
+        "招生",
+        "家长",
+        "监管",
+        "审计",
+        "责任人",
+        "合同",
+        "项目失败",
+        "系统缺陷",
+        "学生安全",
+        "保护学生",
+    ]
+    if _has_any(text, reputation_terms) and not _has_any(text, motivation_support_terms):
+        penalty += 0.75
+        flags.append("unsupported_reputation_motive")
+
+    reveal_terms = ["真相", "原来", "其实", "反转", "幕后", "隐藏"]
+    setup_terms = ["伏笔", "暗示", "早就", "之前", "第一场", "线索", "证据", "记录", "日志", "铺垫"]
+    if _has_any(text, reveal_terms) and len(text) > 400:
+        tail = text[int(len(text) * 0.55):]
+        head = text[: int(len(text) * 0.55)]
+        if _has_any(tail, reveal_terms) and not _has_any(head, setup_terms):
+            penalty += 0.45
+            flags.append("late_reveal_without_setup")
+
+    if _has_any(text, ["为了保护", "为了维护", "为了掩盖"]) and not _has_any(text, ["因为", "导致", "否则", "代价", "后果", "证据"]):
+        penalty += 0.35
+        flags.append("thin_motive_causality")
+
+    return min(2.2, penalty), flags
+
+
+def _has_any(text: str, terms: list[str]) -> bool:
+    return any(term in text for term in terms)
 
 
 def _dialogue_count(text: str) -> int:

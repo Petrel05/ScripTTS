@@ -30,6 +30,10 @@ def main() -> None:
         max_branches=max_branches,
         min_branches=args.min_branches,
         max_active_branches=args.max_active_branches,
+        fork_enabled=not args.disable_fork,
+        fork_score_threshold=args.fork_score_threshold,
+        active_prune_margin=args.active_prune_margin,
+        similarity_prune_threshold=args.similarity_prune_threshold,
         max_scenes=args.max_scenes,
         min_scenes=args.min_scenes,
         max_new_tokens=args.max_new_tokens,
@@ -81,6 +85,7 @@ def build_llm(args: argparse.Namespace):
                 device_map=args.device_map,
                 dtype=args.dtype,
                 local_files_only=not args.allow_remote_files,
+                collect_token_stats=args.collect_token_stats,
             )
         except Exception as exc:
             print(f"[ScripTTS] HF backend unavailable, falling back to mock: {exc}")
@@ -91,6 +96,7 @@ def build_llm(args: argparse.Namespace):
         device_map=args.device_map,
         dtype=args.dtype,
         local_files_only=not args.allow_remote_files,
+        collect_token_stats=args.collect_token_stats,
     )
 
 
@@ -107,11 +113,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16"], default="auto")
     parser.add_argument("--allow-remote-files", action="store_true", help="Allow transformers to fetch missing files.")
+    parser.add_argument("--collect-token-stats", action="store_true", help="Collect generation entropy/top-1 diagnostics.")
 
-    parser.add_argument("--judge-backend", choices=["rule", "llm", "hybrid"], default="rule")
+    parser.add_argument("--judge-backend", choices=["rule", "llm", "hybrid"], default="llm")
     parser.add_argument("--max-branches", type=int, default=2)
     parser.add_argument("--min-branches", type=int, default=3)
     parser.add_argument("--max-active-branches", type=int, default=2)
+    parser.add_argument("--disable-fork", action="store_true")
+    parser.add_argument("--fork-score-threshold", type=float, default=3.85)
+    parser.add_argument("--active-prune-margin", type=float, default=0.75)
+    parser.add_argument("--similarity-prune-threshold", type=float, default=0.72)
     parser.add_argument("--max-scenes", type=int, default=4)
     parser.add_argument("--min-scenes", type=int, default=3)
     parser.add_argument("--max-new-tokens", type=int, default=768)

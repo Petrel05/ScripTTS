@@ -17,12 +17,16 @@ class PipelineConfig:
     max_branches: int = 2
     min_branches: int = 3
     max_active_branches: int = 2
+    fork_enabled: bool = True
+    fork_score_threshold: float = 3.85
+    active_prune_margin: float = 0.75
+    similarity_prune_threshold: float = 0.72
     max_scenes: int = 4
     min_scenes: int = 3
     max_new_tokens: int = 768
     scene_max_new_tokens: int = 768
     temperature: float = 0.7
-    judge_backend: str = "rule"
+    judge_backend: str = "llm"
 
 
 @dataclass
@@ -35,15 +39,26 @@ class PipelineStats:
     stopped_branch_count: int = 0
     stopped_scene_count: int = 0
     wall_time: float = 0.0
+    generation_diagnostics: list[dict[str, float]] | None = None
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
-    def add_generation(self, generation_input_tokens: int, generation_output_tokens: int) -> None:
+    def __post_init__(self) -> None:
+        self.generation_diagnostics = self.generation_diagnostics or []
+
+    def add_generation(
+        self,
+        generation_input_tokens: int,
+        generation_output_tokens: int,
+        diagnostics: dict[str, float] | None = None,
+    ) -> None:
         self.api_calls += 1
         self.input_tokens += generation_input_tokens
         self.output_tokens += generation_output_tokens
+        if diagnostics:
+            self.generation_diagnostics.append(diagnostics)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +71,7 @@ class PipelineStats:
             "stopped_branch_count": self.stopped_branch_count,
             "stopped_scene_count": self.stopped_scene_count,
             "wall_time": round(self.wall_time, 3),
+            "generation_diagnostics": _summarize_generation_diagnostics(self.generation_diagnostics or []),
         }
 
 
@@ -64,6 +80,20 @@ class PipelineResult:
     task_id: str
     final_script: str
     record: dict[str, Any]
+
+
+def _summarize_generation_diagnostics(items: list[dict[str, float]]) -> dict[str, float]:
+    if not items:
+        return {}
+    keys = sorted({key for item in items for key in item})
+    summary = {}
+    for key in keys:
+        values = [float(item[key]) for item in items if key in item]
+        if values:
+            summary[f"{key}_mean"] = round(sum(values) / len(values), 4)
+            summary[f"{key}_max"] = round(max(values), 4)
+    summary["count"] = len(items)
+    return summary
 
 
 @dataclass
@@ -122,7 +152,7 @@ class ScriptPipeline:
                 max_new_tokens=max_new_tokens or self.config.max_new_tokens,
                 temperature=self.config.temperature if temperature is None else temperature,
             )
-            stats.add_generation(generation.input_tokens, generation.output_tokens)
+            stats.add_generation(generation.input_tokens, generation.output_tokens, generation.diagnostics)
             return generation.text.strip()
 
         raw_outputs: dict[str, Any] = {}
@@ -152,7 +182,14 @@ class ScriptPipeline:
             previous_seed += "\n" + seed
             controller_events.append(_controller_event("INIT_BRANCH", branch.branch_id, "seed", branch.status, score.to_dict(), invalid_reason or "initial_seed"))
 
-        active = _controller_prune(branches, self.config.max_active_branches, controller_events, "seed")
+        active = _controller_prune(
+            branches,
+            self.config.max_active_branches,
+            controller_events,
+            "seed",
+            self.config.active_prune_margin,
+            self.config.similarity_prune_threshold,
+        )
 
         for branch in list(active):
             storyline_raw = call(_storyline_prompt(task, task_card, branch.seed))
@@ -164,7 +201,46 @@ class ScriptPipeline:
             branch.stage = "storyline"
             branch.decisions.append(_decision_event("storyline", "keep", "expanded_storyline", score.to_dict()))
             controller_events.append(_controller_event("EXPAND_STORYLINE", branch.branch_id, "storyline", branch.status, score.to_dict(), "depth+1"))
-        active = _controller_prune(branches, self.config.max_active_branches, controller_events, "storyline")
+        if self.config.fork_enabled:
+            for parent in list(active):
+                if stats.branch_count >= self.config.max_branches:
+                    break
+                if _branch_rank(parent) < self.config.fork_score_threshold:
+                    continue
+                if any(branch.parent_id == parent.branch_id for branch in branches):
+                    continue
+                new_id = max(branch.branch_id for branch in branches) + 1
+                siblings = "\n".join(branch.seed for branch in branches)
+                fork_raw = call(_fork_seed_prompt(task, task_card, parent, new_id, siblings), temperature=min(self.config.temperature + 0.15, 1.0))
+                raw_outputs[f"branch_{new_id}_fork_seed"] = fork_raw
+                fork_seed_data = _coerce_seed(fork_raw, new_id)
+                fork_seed = _format_seed(fork_seed_data)
+                seed_score = self._judge(fork_seed, task.user_prompt, siblings, stats)
+                fork_branch = BranchState(branch_id=new_id, parent_id=parent.branch_id, seed=fork_seed, seed_data=fork_seed_data)
+                fork_branch.scores["seed"] = seed_score.to_dict()
+                fork_branch.decisions.append(_decision_event("seed", "fork", f"fork_from_branch_{parent.branch_id}", seed_score.to_dict()))
+                branches.append(fork_branch)
+                stats.branch_count += 1
+                controller_events.append(_controller_event("FORK_BRANCH", fork_branch.branch_id, "storyline", "active", seed_score.to_dict(), f"parent={parent.branch_id}"))
+
+                storyline_raw = call(_storyline_prompt(task, task_card, fork_branch.seed))
+                raw_outputs[f"branch_{fork_branch.branch_id}_storyline"] = storyline_raw
+                fork_branch.storyline_data = _coerce_storyline(storyline_raw)
+                fork_branch.storyline = _format_storyline(fork_branch.storyline_data)
+                storyline_score = self._judge(fork_branch.storyline, _branch_judge_context(task, fork_branch, "storyline"), fork_branch.seed, stats)
+                fork_branch.scores["storyline"] = storyline_score.to_dict()
+                fork_branch.stage = "storyline"
+                fork_branch.decisions.append(_decision_event("storyline", "keep", "expanded_fork_storyline", storyline_score.to_dict()))
+                controller_events.append(_controller_event("EXPAND_STORYLINE", fork_branch.branch_id, "storyline", fork_branch.status, storyline_score.to_dict(), "fork_depth+1"))
+
+        active = _controller_prune(
+            branches,
+            self.config.max_active_branches,
+            controller_events,
+            "storyline",
+            self.config.active_prune_margin,
+            self.config.similarity_prune_threshold,
+        )
 
         for branch in list(active):
             characters_raw = call(_character_prompt(task, task_card, branch.storyline))
@@ -176,7 +252,14 @@ class ScriptPipeline:
             branch.stage = "characters"
             branch.decisions.append(_decision_event("characters", "keep", "expanded_characters", score.to_dict()))
             controller_events.append(_controller_event("EXPAND_CHARACTERS", branch.branch_id, "characters", branch.status, score.to_dict(), "depth+1"))
-        active = _controller_prune(branches, self.config.max_active_branches, controller_events, "characters")
+        active = _controller_prune(
+            branches,
+            self.config.max_active_branches,
+            controller_events,
+            "characters",
+            self.config.active_prune_margin,
+            self.config.similarity_prune_threshold,
+        )
 
         for branch in list(active):
             outline_raw = call(_outline_prompt(task, task_card, branch.storyline, branch.characters))
@@ -189,7 +272,14 @@ class ScriptPipeline:
             branch.stage = "outline"
             branch.decisions.append(_decision_event("outline", "keep", "expanded_outline", score.to_dict()))
             controller_events.append(_controller_event("EXPAND_OUTLINE", branch.branch_id, "outline", branch.status, score.to_dict(), "depth+1"))
-        active = _controller_prune(branches, self.config.max_active_branches, controller_events, "outline")
+        active = _controller_prune(
+            branches,
+            self.config.max_active_branches,
+            controller_events,
+            "outline",
+            self.config.active_prune_margin,
+            self.config.similarity_prune_threshold,
+        )
 
         for scene_idx in range(1, self.config.max_scenes + 1):
             scene_active = [branch for branch in active if branch.status == "active"]
@@ -213,6 +303,7 @@ class ScriptPipeline:
                         previous_text=generated_so_far,
                         scene_idx=scene_idx,
                         scene_goal=scene_goal,
+                        total_scene_goals=len(branch.scene_goals or []),
                     ),
                     max_new_tokens=self.config.scene_max_new_tokens,
                 )
@@ -243,7 +334,14 @@ class ScriptPipeline:
                     stats.stopped_scene_count += 1
                 branch.decisions.append(_decision_event(f"scene_{scene_idx}", decision, reason, score_dict))
                 controller_events.append(_controller_event("EXPAND_SCENE", branch.branch_id, f"scene_{scene_idx}", branch.status, score_dict, reason))
-            active = _controller_prune(branches, self.config.max_active_branches, controller_events, f"scene_{scene_idx}")
+            active = _controller_prune(
+                branches,
+                self.config.max_active_branches,
+                controller_events,
+                f"scene_{scene_idx}",
+                self.config.active_prune_margin,
+                self.config.similarity_prune_threshold,
+            )
 
         for branch in branches:
             if branch.status == "active" and branch.scenes:
@@ -256,7 +354,8 @@ class ScriptPipeline:
             candidates = [branch for branch in branches if branch.scenes] or branches
         for branch in candidates:
             final_text = _compose_final_script(task, branch.characters, branch.outline, branch.scenes)
-            final_score = self._final_judge(final_text, task.user_prompt, stats)
+            final_score = self._final_judge(final_text, _final_judge_context(task, branch), stats)
+            final_score = _calibrate_final_completion(final_score, branch)
             branch.scores["final"] = final_score.to_dict()
             branch.decisions.append(_decision_event("final", "candidate", "final_judge", final_score.to_dict()))
             controller_events.append(_controller_event("FINAL_JUDGE", branch.branch_id, "final", branch.status, final_score.to_dict(), "candidate"))
@@ -307,7 +406,7 @@ class ScriptPipeline:
         if self.config.judge_backend == "llm":
             prompt = build_llm_judge_prompt(candidate, task_prompt, previous_text)
             generation = self.llm.generate(prompt, max_new_tokens=512, temperature=0.0)
-            stats.add_generation(generation.input_tokens, generation.output_tokens)
+            stats.add_generation(generation.input_tokens, generation.output_tokens, generation.diagnostics)
             stats.judge_calls += 1
             return parse_llm_judge_response(generation.text, candidate, task_prompt, previous_text)
         return rule_judge(candidate, task_prompt, previous_text)
@@ -316,7 +415,7 @@ class ScriptPipeline:
         if self.config.judge_backend in {"llm", "hybrid"}:
             prompt = build_llm_judge_prompt(candidate, task_prompt, "")
             generation = self.llm.generate(prompt, max_new_tokens=512, temperature=0.0)
-            stats.add_generation(generation.input_tokens, generation.output_tokens)
+            stats.add_generation(generation.input_tokens, generation.output_tokens, generation.diagnostics)
             stats.judge_calls += 1
             return parse_llm_judge_response(generation.text, candidate, task_prompt, "")
         return rule_judge(candidate, task_prompt, "")
@@ -327,8 +426,39 @@ def _controller_prune(
     max_active: int,
     controller_events: list[dict[str, Any]],
     stage: str,
+    active_prune_margin: float,
+    similarity_prune_threshold: float,
 ) -> list[BranchState]:
     active = [branch for branch in branches if branch.status == "active"]
+    active.sort(key=_branch_rank, reverse=True)
+    if not active:
+        return []
+    best_rank = _branch_rank(active[0])
+    weak_prune = [
+        branch for branch in active[1:]
+        if best_rank - _branch_rank(branch) > active_prune_margin and len(active) > 1
+    ]
+    for branch in weak_prune:
+        branch.status = "pruned"
+        score = branch.latest_score()
+        branch.decisions.append(_decision_event(stage, "prune", "active_prune_margin", score))
+        controller_events.append(_controller_event("PRUNE_BRANCH", branch.branch_id, stage, "pruned", score, "active_prune_margin"))
+
+    active = [branch for branch in active if branch.status == "active"]
+    active.sort(key=_branch_rank, reverse=True)
+    for i, keeper in enumerate(active):
+        for candidate in active[i + 1:]:
+            if candidate.status != "active":
+                continue
+            similarity = _branch_similarity(keeper, candidate)
+            if similarity >= similarity_prune_threshold:
+                candidate.status = "pruned"
+                score = candidate.latest_score()
+                reason = f"similar_to_branch_{keeper.branch_id}:{similarity:.2f}"
+                candidate.decisions.append(_decision_event(stage, "prune", reason, score))
+                controller_events.append(_controller_event("PRUNE_BRANCH", candidate.branch_id, stage, "pruned", score, reason))
+
+    active = [branch for branch in active if branch.status == "active"]
     active.sort(key=_branch_rank, reverse=True)
     keep = active[:max_active]
     prune = active[max_active:]
@@ -345,15 +475,39 @@ def _branch_rank(branch: BranchState) -> float:
     final_bonus = 0.4 if "final" in (branch.scores or {}) else 0.0
     depth_bonus = min(len(branch.scenes or []), 4) * 0.08
     diversity_bonus = _branch_diversity_bonus(branch)
-    return (
-        float(latest.get("overall_quality", 0)) * 0.45
-        + float(latest.get("useful_surprise", 0)) * 0.35
-        + float(latest.get("logic_consistency", 0)) * 0.12
-        + float(latest.get("character_consistency", 0)) * 0.08
-        + depth_bonus
-        + diversity_bonus
-        + final_bonus
+    gain_bonus = _branch_gain_bonus(branch)
+    return _score_rank(latest) + depth_bonus + diversity_bonus + gain_bonus + final_bonus
+
+
+def _score_rank(score: dict[str, Any]) -> float:
+    logic = float(score.get("logic_consistency", 0))
+    base = (
+        float(score.get("overall_quality", 0)) * 0.35
+        + float(score.get("useful_surprise", 0)) * 0.25
+        + logic * 0.28
+        + float(score.get("character_consistency", 0)) * 0.12
     )
+    if logic < 3.1:
+        base -= 1.2 + (3.1 - logic) * 0.7
+    if _score_has_premise_flaw(score):
+        base -= 1.0
+    return base
+
+
+def _score_has_premise_flaw(score: dict[str, Any]) -> bool:
+    comments = str(score.get("comments", ""))
+    severe_flags = [
+        "ai_tutor_cheating_premise",
+        "cheating_without_wrongdoing",
+        "unsupported_reputation_motive",
+        "核心冲突不成立",
+        "前提不成立",
+        "动机不成立",
+        "动机薄弱",
+        "缺少因果",
+        "无因果",
+    ]
+    return any(flag in comments for flag in severe_flags)
 
 
 def _branch_diversity_bonus(branch: BranchState) -> float:
@@ -363,11 +517,41 @@ def _branch_diversity_bonus(branch: BranchState) -> float:
     return 0.0
 
 
+def _branch_gain_bonus(branch: BranchState) -> float:
+    scores = list((branch.scores or {}).values())
+    if len(scores) < 2:
+        return 0.0
+    prev, cur = scores[-2], scores[-1]
+    surprise_gain = float(cur.get("useful_surprise", 0)) - float(prev.get("useful_surprise", 0))
+    quality_gain = float(cur.get("overall_quality", 0)) - float(prev.get("overall_quality", 0))
+    return max(-0.15, min(0.2, surprise_gain * 0.08 + quality_gain * 0.12))
+
+
+def _branch_similarity(a: BranchState, b: BranchState) -> float:
+    a_terms = set(_branch_terms(a))
+    b_terms = set(_branch_terms(b))
+    if not a_terms or not b_terms:
+        return 0.0
+    return len(a_terms & b_terms) / len(a_terms | b_terms)
+
+
+def _branch_terms(branch: BranchState) -> list[str]:
+    text = "\n".join([branch.seed, branch.storyline, branch.characters, branch.outline])
+    terms = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9_-]{2,}", text)
+    stop = {"角色", "目标", "关系", "冲突", "学生", "老师", "助教", "AI", "场景", "主要事件"}
+    seen = []
+    for term in terms:
+        if term in stop or term in seen:
+            continue
+        seen.append(term)
+    return seen[:40]
+
+
 def _branch_scene_stop(branch: BranchState, score: JudgeScores, scene_idx: int, min_scenes: int) -> tuple[bool, str]:
     if scene_idx < min_scenes:
         return False, f"min_scenes_{min_scenes}_not_reached"
     invalid, invalid_reason = _invalid_reason(score)
-    if invalid_reason in {"low_logic_consistency", "low_overall_quality"}:
+    if invalid_reason in {"premise_flaw", "low_logic_consistency", "low_overall_quality"}:
         return True, invalid_reason
     scene_scores = []
     for scene in branch.scenes or []:
@@ -390,6 +574,52 @@ def _branch_scene_stop(branch: BranchState, score: JudgeScores, scene_idx: int, 
     if invalid:
         return False, invalid_reason
     return False, "continue"
+
+
+def _final_judge_context(task: ScriptTask, branch: BranchState) -> str:
+    outline_scenes = branch.outline_data.get("scenes", []) if isinstance(branch.outline_data, dict) else []
+    expected = max(len(branch.scene_goals or []), len(outline_scenes) if isinstance(outline_scenes, list) else 0)
+    actual = len(branch.scenes or [])
+    final_goal = branch.scene_goals[-1] if branch.scene_goals else ""
+    return f"""用户任务：{task.user_prompt}
+最终完整性要求：
+- 大纲计划场数：{expected}
+- 已生成场数：{actual}
+- 最后一场目标：{final_goal or "无"}
+- 最终剧本必须覆盖大纲最后一场；如果只停在钩子、等待抉择、尚未揭示反转，plot_progress 和 overall_quality 最高 3.0。
+- 动作、舞台调度、非对白叙述是允许且重要的，但必须推动冲突或揭示信息，不能只是空泛氛围。
+"""
+
+
+def _calibrate_final_completion(score: JudgeScores, branch: BranchState) -> JudgeScores:
+    outline_scenes = branch.outline_data.get("scenes", []) if isinstance(branch.outline_data, dict) else []
+    expected = max(len(branch.scene_goals or []), len(outline_scenes) if isinstance(outline_scenes, list) else 0)
+    actual = len(branch.scenes or [])
+    if expected and actual < expected:
+        score.plot_progress = min(score.plot_progress, 3.0)
+        score.overall_quality = min(score.overall_quality, 3.0)
+        score.logic_consistency = min(score.logic_consistency, 3.3)
+        score.comments = _append_comment(score.comments, f"incomplete_outline:{actual}/{expected}")
+        return score
+
+    if branch.scenes:
+        last_text = str(branch.scenes[-1].get("text", ""))
+        final_goal = str((branch.scene_goals or [""])[-1])
+        closure_terms = ["最终", "最后", "结尾", "真相", "反转", "揭示", "承认", "公开", "选择", "决定", "解决", "恢复", "自我销毁", "牺牲"]
+        dangling_terms = ["等待", "即将", "准备", "下一步", "屏住呼吸", "最终的抉择"]
+        needs_closure = any(term in final_goal for term in ["最终", "真相", "结尾", "抉择", "反转", "揭示"])
+        has_closure = any(term in last_text for term in closure_terms)
+        still_dangling = any(term in last_text[-220:] for term in dangling_terms)
+        if needs_closure and (not has_closure or still_dangling):
+            score.plot_progress = min(score.plot_progress, 3.2)
+            score.overall_quality = min(score.overall_quality, 3.2)
+            score.comments = _append_comment(score.comments, "weak_final_closure")
+    return score
+
+
+def _append_comment(primary: str, extra: str, limit: int = 160) -> str:
+    merged = f"{primary}; {extra}" if primary else extra
+    return merged[:limit]
 
 
 def _decision_event(stage: str, decision: str, reason: str, score: dict[str, Any]) -> dict[str, Any]:
@@ -415,13 +645,7 @@ def _controller_event(
         "stage": stage,
         "status": status,
         "reason": reason,
-        "rank_score": round(
-            float(score.get("overall_quality", 0)) * 0.45
-            + float(score.get("useful_surprise", 0)) * 0.35
-            + float(score.get("logic_consistency", 0)) * 0.12
-            + float(score.get("character_consistency", 0)) * 0.08,
-            3,
-        ),
+        "rank_score": round(_score_rank(score), 3),
         "score": score,
     }
 
@@ -492,6 +716,7 @@ def _compose_trace_markdown(record: dict[str, Any]) -> str:
         f"- Branches: generated={metrics.get('branch_count', 0)}, stopped={metrics.get('stopped_branch_count', 0)}",
         f"- Scenes: generated={len(record.get('scenes', []))}, stopped={metrics.get('stopped_scene_count', 0)}",
         f"- Wall time: {metrics.get('wall_time', 0)}s",
+        f"- Generation diagnostics: {_one_line(metrics.get('generation_diagnostics', {}), 500)}",
         "",
         "## Stage 0: Requirement Normalization",
         "```json",
@@ -595,12 +820,15 @@ def _compose_trace_markdown(record: dict[str, Any]) -> str:
 
 
 def _score_line(score: dict[str, Any]) -> str:
-    return (
+    line = (
         f"- Scores: useful_surprise={score.get('useful_surprise')}, "
         f"novelty={score.get('novelty')}, relevance={score.get('relevance')}, "
         f"plot={score.get('plot_progress')}, logic={score.get('logic_consistency')}, "
         f"character={score.get('character_consistency')}, overall={score.get('overall_quality')}"
     )
+    if score.get("comments"):
+        line += f", comments={_one_line(score.get('comments'), 220)}"
+    return line
 
 
 def _one_line(value: Any, limit: int) -> str:
@@ -823,20 +1051,25 @@ def _coerce_scene(raw: str, scene_idx: int, scene_goal: str, characters_data: di
                         line = embedded_line.strip()
                 if not speaker and line and fallback_speakers:
                     speaker = fallback_speakers[idx % len(fallback_speakers)]
+                speaker = _normalize_speaker(speaker, fallback_speakers)
                 if speaker and line:
                     parsed_dialogue.append({"speaker": speaker, "line": line})
             elif isinstance(item, str) and "：" in item:
                 speaker, line = item.split("：", 1)
-                parsed_dialogue.append({"speaker": speaker.strip(), "line": line.strip()})
+                speaker = _normalize_speaker(speaker.strip(), fallback_speakers)
+                if speaker and line.strip():
+                    parsed_dialogue.append({"speaker": speaker, "line": line.strip()})
     text = _clean_model_text(raw)
     if not parsed_dialogue:
-        parsed_dialogue = _parse_dialogue_lines(text)
+        parsed_dialogue = _parse_dialogue_lines(text, fallback_speakers)
     stage_direction = str(data.get("stage_direction") or data.get("舞台说明") or _extract_bracket(text, "舞台说明") or scene_goal)
+    action_beats = _coerce_action_beats(data, text)
     hook = str(data.get("hook") or data.get("本场结尾钩子") or _extract_bracket(text, "本场结尾钩子") or _extract_labeled(text, "结尾钩子"))
     return {
         "scene_id": data.get("scene_id") or scene_idx,
         "location_time": str(data.get("location_time") or data.get("地点时间") or data.get("地点") or "地点 / 时间"),
         "stage_direction": _clean_model_text(stage_direction),
+        "action_beats": action_beats,
         "dialogue": parsed_dialogue,
         "hook": _clean_model_text(hook),
     }
@@ -860,6 +1093,10 @@ def _format_scene(data: dict[str, Any]) -> str:
     stage_direction = str(data.get("stage_direction") or "").strip()
     if stage_direction:
         lines.append(f"【舞台说明】{stage_direction}")
+    for beat in data.get("action_beats", []):
+        beat_text = str(beat).strip()
+        if beat_text:
+            lines.append(f"【动作】{beat_text}")
     for item in data.get("dialogue", []):
         if not isinstance(item, dict):
             continue
@@ -877,7 +1114,9 @@ def _invalid_reason(score: JudgeScores, stage: str = "text") -> tuple[bool, str]
     min_relevance = 2.2 if stage == "branch" else 2.5
     if score.relevance < min_relevance:
         return True, "low_relevance"
-    if score.logic_consistency < 2.8:
+    if _score_has_premise_flaw(score.to_dict()):
+        return True, "premise_flaw"
+    if score.logic_consistency < 3.1:
         return True, "low_logic_consistency"
     if score.overall_quality < 2.4:
         return True, "low_overall_quality"
@@ -1032,15 +1271,42 @@ def _default_outline_scenes() -> list[dict[str, Any]]:
     ]
 
 
-def _parse_dialogue_lines(text: str) -> list[dict[str, str]]:
+def _coerce_action_beats(data: dict[str, Any], text: str) -> list[str]:
+    raw_beats = data.get("action_beats") or data.get("actions") or data.get("动作") or []
+    beats: list[str] = []
+    if isinstance(raw_beats, list):
+        beats = [str(item).strip() for item in raw_beats if str(item).strip()]
+    elif isinstance(raw_beats, str) and raw_beats.strip():
+        beats = [part.strip() for part in re.split(r"[；;\n]", raw_beats) if part.strip()]
+    if not beats:
+        for match in re.finditer(r"【(?:动作|舞台动作|调度)】\s*([^\n]+)", text):
+            beats.append(match.group(1).strip())
+    return beats[:4]
+
+
+def _normalize_speaker(speaker: str, character_names: list[str]) -> str:
+    speaker = re.sub(r"^[#\-\*\s]+", "", speaker).strip().strip("'\"")
+    if not speaker or speaker == "角色名":
+        return ""
+    for name in character_names:
+        if name and name in speaker:
+            return name
+    speaker = re.split(r"的|（|\(|，|,|、|\s", speaker, maxsplit=1)[0].strip()
+    if 1 <= len(speaker) <= 8 and speaker not in {"地点", "时间", "场景"}:
+        return speaker
+    return ""
+
+
+def _parse_dialogue_lines(text: str, character_names: list[str] | None = None) -> list[dict[str, str]]:
     dialogue = []
+    character_names = character_names or []
     for line in text.splitlines():
         stripped = line.strip()
         if "：" not in stripped or stripped.startswith("【"):
             continue
         speaker, content = stripped.split("：", 1)
-        speaker = re.sub(r"^[#\-\*\s]+", "", speaker).strip()
-        if 1 <= len(speaker) <= 12 and content.strip() and speaker not in {"地点", "时间", "场景", "角色名"}:
+        speaker = _normalize_speaker(speaker, character_names)
+        if speaker and content.strip():
             dialogue.append({"speaker": speaker, "line": content.strip()})
     return dialogue
 
@@ -1085,6 +1351,35 @@ JSON schema：
 
 已有种子，避免重复：
 {previous_seed or "无"}
+"""
+
+
+def _fork_seed_prompt(task: ScriptTask, task_card: str, parent: BranchState, branch_idx: int, sibling_seeds: str) -> str:
+    return f"""Stage 1 分支分叉。请基于一个强分支生成 1 个 sibling seed。
+只输出一个 JSON 对象，不要 Markdown，不要解释，不要写完整剧本。
+
+目标：保留父分支的优点，但必须改变“冲突机制”或“反转机制”，避免和已有分支相似。
+
+JSON schema：
+{{
+  "seed_id": {branch_idx},
+  "idea": "一句话创意",
+  "core_conflict": "核心冲突，必须与父分支不同",
+  "twist": "结尾反转，必须与父分支不同",
+  "risk": "潜在风险"
+}}
+
+任务卡：
+{task_card}
+
+父分支 seed：
+{parent.seed}
+
+父分支 storyline：
+{parent.storyline}
+
+已有全部 seed，避免重复：
+{sibling_seeds or "无"}
 """
 
 
@@ -1162,7 +1457,14 @@ def _scene_prompt(
     previous_text: str,
     scene_idx: int,
     scene_goal: str,
+    total_scene_goals: int,
 ) -> str:
+    is_final_scene = total_scene_goals > 0 and scene_idx >= total_scene_goals
+    final_requirement = (
+        "本场是最终场：必须完成核心选择、揭示反转并收束主要冲突；hook 只能是余味或新状态画面，不能停在等待决定、即将选择、尚未揭示。"
+        if is_final_scene
+        else "本场不是最终场：可以保留钩子，但必须完成当前场目标。"
+    )
     return f"""Stage 5 逐场剧本生成。请只写当前场，不要重写前文。
 只输出一个 JSON 对象，不要 Markdown，不要解释。
 
@@ -1171,6 +1473,7 @@ JSON schema：
   "scene_id": {scene_idx},
   "location_time": "地点 / 时间",
   "stage_direction": "舞台说明，包含动作和空间变化",
+  "action_beats": ["非对白动作/调度/发现，必须推动冲突或揭示信息"],
   "dialogue": [
     {{"speaker": "角色名", "line": "对白"}}
   ],
@@ -1193,8 +1496,10 @@ JSON schema：
 {previous_text[-1200:] or "无"}
 
 当前场：第{scene_idx}场：{scene_goal}
+场次进度：第{scene_idx}/{total_scene_goals or "未知"}场
+结尾要求：{final_requirement}
 
-要求：至少 6 句对白；必须有动作推进；不要重复已有前文；不要输出“角色名：”这种占位文本。
+要求：动作和对白都可以推进剧情；至少 3 句对白，至少 2 个 action_beats；speaker 只能使用人物表中的姓名，不要把动作写进 speaker；不要重复已有前文；不要输出“角色名：”这种占位文本。
 """
 
 
@@ -1214,7 +1519,7 @@ def _extract_scene_goals(outline: str, max_scenes: int, outline_data: dict[str, 
                 if goal:
                     goals.append(goal)
             if goals:
-                return goals[:max_scenes]
+                return goals[: max(max_scenes, len(goals))]
     lines = [line.strip() for line in outline.splitlines() if line.strip()]
     goals = [line for line in lines if re.search(r"第\s*[一二三四五六七八九十\d]+\s*场|scene\s*\d+", line, flags=re.I)]
     if not goals:
@@ -1222,7 +1527,7 @@ def _extract_scene_goals(outline: str, max_scenes: int, outline_data: dict[str, 
         goals = [chunk.strip() for chunk in chunks if len(chunk.strip()) >= 8]
     if not goals:
         goals = ["开端与异常出现", "冲突升级与误导线索", "真相揭示与反转收束"]
-    return goals[:max_scenes]
+    return goals[: max(max_scenes, len(goals))]
 
 
 def _compose_final_script(task: ScriptTask, characters: str, outline: str, scenes: list[dict[str, Any]]) -> str:
