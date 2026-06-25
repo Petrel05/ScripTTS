@@ -24,7 +24,7 @@ User Prompt
   → Final Judge → 选最优分支 → 输出剧本 + trace
 ```
 
-**关键特性**：每个 `生成 → judge → 决策` 循环都是**紧耦合的**，controller 在每个阶段之后都会运行剪枝逻辑，而不是等所有内容生成完再回头挑选。
+每个 `生成 → judge → 决策` 循环都是**紧耦合的**，controller 在每个阶段之后都会运行剪枝逻辑，而不是等所有内容生成完再回头挑选。
 
 ---
 
@@ -127,22 +127,79 @@ if 连续两场 useful_surprise < 3.2
 
 ---
 
-## 5. Token 节省分析
+## 5. Token 消耗模型与控制收益
 
-### 省 Token 机制
+Controller 的 prune / stop 决策会减少后续调用，但 judge 本身也是开销。本节给出精确的成本分解和节省来源。
 
-| 机制 | 原理 | 节省量级 |
-|------|------|---------|
-| **Scene Stop** | 质量够了就停，不写满所有场 | 每场 ~768 token 输出 + prompt |
-| **Branch Prune** | 低分/相似分支直接杀死 | 省掉后续全部 stage 的 token |
-| **Similarity Dedup** | 相似分支只留一个 | 避免重复生成 |
-| **Rescue 保底** | 正常情况不触发 | 避免空跑浪费 |
+### 5.1 调用次数上限（无任何干预时）
 
-### 定量估算（默认配置）
+默认配置 `min_branches=3, max_branches=2, max_active_branches=2, max_scenes=4` 下，若 controller 完全不干预（不剪枝、不早停、不 fork），调用次数为：
 
-- **最坏情况（无剪枝）**：~16 次 LLM 调用
-- **典型情况（有剪枝）**：节省 25–50% 调用
-- **Judge 开销**：每次 `max_new_tokens=512`（6 维 JSON 很短），可控
+| 阶段 | Gen 调用 | Judge 调用 | 说明 |
+|------|---------|-----------|------|
+| Stage 0 规范化 | 1 | 0 | |
+| Stage 1 Seed ×2 | 2 | 2 | `initial_count = min(max(3,1), 2) = 2` |
+| Fork | 0 | 0 | `branch_count(2) ≥ max_branches(2)`，不触发 |
+| Stage 2 Storyline ×2 | 2 | 2 | |
+| Stage 3 Characters ×2 | 2 | 2 | |
+| Stage 4 Outline ×2 | 2 | 2 | |
+| Stage 5 Scenes ×(2×4) | 8 | 8 | |
+| Final Judge ×2 | 0 | 2 | judge only |
+| **合计** | **17** | **18** | **35 次** |
+
+> 注：Gen 调用 `max_new_tokens` 默认 768（可能触发 retry 翻倍至 1536 甚至 3072），Judge 调用默认 512。上表不含 retry，每次 retry 额外 +1 gen 调用。
+
+### 5.2 每次干预节省的调用数
+
+以 35 次为无干预上限，每次剪枝/早停实际节省的调用数取决于发生时机：
+
+| 干预时机 | 已消耗（该分支） | 被跳过的阶段 | 节省调用 |
+|----------|-----------------|-------------|---------|
+| Seed 后 prune | gen+judge=2 | Storyline + Char + Outline + 4 Scenes + Final | **15** |
+| Storyline 后 prune | 4 | Char + Outline + 4 Scenes + Final | **13** |
+| Characters 后 prune | 6 | Outline + 4 Scenes + Final | **11** |
+| Outline 后 prune | 8 | 4 Scenes + Final | **9** |
+| Scene 2 后早停 | 已完成 2 场 | 剩余 2 场的 gen+judge | **4** |
+| Similarity dedup | 视去重阶段而定 | 同对应阶段的 prune | 9–15 |
+
+**逻辑**：越早剪掉劣质分支，节省越多。Seed 阶段一次 prune（15 调用）约等于节省了 43% 的最大调用预算。
+
+### 5.3 Judge 开销是否值得
+
+相比"不用 controller，所有分支跑完再评选"的方案（17 gen + 2 final judge = 19 调用），controller 额外增加了 16 次 intermediate judge（35 − 19）。
+
+- **若 1 个分支在 Stage 2 被 prune**：额外开销 16 judge，节省 13 调用 → 净增 3 调用，但避免了 4 场低质量 scene 的生成。
+- **若 1 个分支在 Stage 1 被 prune**：额外 16，节省 15 → 接近持平。
+- **若 0 个分支被 prune**：controller 是纯开销（+16 judge），但这只有在两个分支质量完全相等且都很好的理想情况下才会发生。
+
+**结论**：controller 的净收益来自**避免在劣质分支上浪费昂贵的 scene 生成调用**（每个 scene gen 输出上限 768 token，而 judge 输出上限 512 token）。只要至少剪掉 1 个分支，token 层面基本持平或略省；真正的收益是质量——避免把劣质内容写进最终剧本。
+
+### 5.4 何处真正省 Token
+
+Controller 省的不是 judge 调用本身，而是**被剪分支后续 stage 的 gen 调用**。Gen 调用的 prompt 随上下文累积而膨胀（scene 阶段 prompt 包含 task_card + storyline + characters + outline + previous_text，可达 1500+ token 输入），输出上限 768 token。Judge 调用的 prompt 较短（candidate 截断 + task_prompt），输出上限 512 token。因此：
+
+- 每跳过一次 scene gen → 节省 ~1500 input + ~768 output token
+- 每跳过一次 judge → 节省 ~800 input + ~200 output token
+- 总账：跳过一个 gen 的收益大约是跳过一个 judge 的 2–3 倍
+
+Controller 的设计目标就是**用便宜的 judge 调用去避免昂贵的 gen 调用**。
+
+### 5.5 实验观测
+
+| 实验 | 调用数 | vs 上限 35 | 说明 |
+|------|--------|-----------|------|
+| Qwen3-8B + LLM judge v1 | 34 | −1（~3%） | 几乎无剪枝 |
+| Qwen3-8B + LLM judge v2 | 30 | −5（~14%） | 少量剪枝或早停 |
+| DeepSeek v4 Pro v2 | 20 | −15（~43%） | 明显剪枝 + 早停 |
+
+这些数字与模型行为直接相关：DeepSeek 生成质量更高、分支差异更大，controller 的相似度去重和 active-prune-margin 更容易触发；而本地 8B 模型两个分支常趋同，剪枝机会少。**节省率因模型而异，不应被当作常数。**
+
+### 5.6 限制与注意事项
+
+1. **没有实现无 controller 对照组**：目前 pipeline 始终运行 controller，上述节省估算是对"如果所有分支跑满所有阶段"的理论上限推算，而非实测对照。
+2. **Retry 机制增加方差**：`finish_reason=length` 或 JSON 解析失败会触发重试（token limit 翻倍），实际调用数可能超出 35。真实情况下需要将 retry 成本也纳入。
+3. **与 one-shot 的对比是不同维度**：one-shot 只需 1 次调用，但完全没有多分支探索和质量保障。controller 的价值不在与 one-shot 比 token 效率，而在于：相比 naive multi-branch（全跑完），controller 削减了不必要的开销；相比 one-shot，controller 用合理的额外预算换取了多分支探索带来的质量提升。
+4. **节省率需要通过对照实验验证**：要得到可靠的 "token 节省 X%" 结论，需要在同一 prompt 集合上跑 "无 controller 的固定 multi-branch" 和 "带 controller 的动态多分支" 两组的对比实验。
 
 ---
 
