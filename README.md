@@ -16,7 +16,7 @@
 ```
 User Prompt
   → Stage 0  需求规范化 (task_card)
-  → Stage 1  创意种子生成 (seed) ×N → judge → prune
+  → Stage 1  创意种子生成 (seed) ×3 → judge → prune
   → Stage 2  剧情主线规划 (storyline)   → judge → fork / prune
   → Stage 3  人物与冲突设计 (characters) → judge → prune
   → Stage 4  分场大纲 (outline)         → judge → prune
@@ -24,7 +24,7 @@ User Prompt
   → Final Judge → 选最优分支 → 输出剧本 + trace
 ```
 
-每个 `生成 → judge → 决策` 循环都是**紧耦合的**，controller 在每个阶段之后都会运行剪枝逻辑，而不是等所有内容生成完再回头挑选。
+默认同时维护 3 个初始种子、最多 5 个分支（含 fork）、最多 3 个活跃分支。每个 `生成 → judge → 决策` 循环都是**紧耦合的**，controller 在每个阶段之后都会运行剪枝逻辑。
 
 ---
 
@@ -127,79 +127,119 @@ if 连续两场 useful_surprise < 3.2
 
 ---
 
-## 5. Token 消耗模型与控制收益
+## 5. Token 消耗模型与真实对照
 
-Controller 的 prune / stop 决策会减少后续调用，但 judge 本身也是开销。本节给出精确的成本分解和节省来源。
+Controller **理论上**通过 prune / stop 跳过后续阶段来省 token；但真实收益必须用同一 prompt、同一模型、同一 judge 的 controller vs no-controller 对照来验证。当前 Qwen3-8B + Qwen3-8B LLM judge 的 `script_001` 实验没有观察到 token 节省，默认 fork 反而增加了开销。
 
-### 5.1 调用次数上限（无任何干预时）
+### 5.1 调用次数模型（默认配置）
 
-默认配置 `min_branches=3, max_branches=2, max_active_branches=2, max_scenes=4` 下，若 controller 完全不干预（不剪枝、不早停、不 fork），调用次数为：
+`min_branches=3, max_branches=5, max_active_branches=3, max_scenes=4`：
 
-| 阶段 | Gen 调用 | Judge 调用 | 说明 |
-|------|---------|-----------|------|
+- 初始种子数 = `min(max(3,1), 5)` = **3**
+- Fork 上限 = `max_branches(5) − 初始(3)` = 最多 **2 次 fork**
+
+**无 Controller 干预时**（`--disable-controller`，fork 也关闭）：
+
+| 阶段 | Gen | Judge | 说明 |
+|------|-----|-------|------|
 | Stage 0 规范化 | 1 | 0 | |
-| Stage 1 Seed ×2 | 2 | 2 | `initial_count = min(max(3,1), 2) = 2` |
-| Fork | 0 | 0 | `branch_count(2) ≥ max_branches(2)`，不触发 |
-| Stage 2 Storyline ×2 | 2 | 2 | |
-| Stage 3 Characters ×2 | 2 | 2 | |
-| Stage 4 Outline ×2 | 2 | 2 | |
-| Stage 5 Scenes ×(2×4) | 8 | 8 | |
-| Final Judge ×2 | 0 | 2 | judge only |
-| **合计** | **17** | **18** | **35 次** |
+| Stage 1 Seed ×3 | 3 | 3 | |
+| Stage 2 Storyline ×3 | 3 | 3 | |
+| Stage 3 Characters ×3 | 3 | 3 | |
+| Stage 4 Outline ×3 | 3 | 3 | |
+| Stage 5 Scenes ×(3×4) | 12 | 12 | |
+| Final Judge ×3 | 0 | 3 | judge only |
+| **合计** | **25** | **27** | **52 次** |
 
-> 注：Gen 调用 `max_new_tokens` 默认 768（可能触发 retry 翻倍至 1536 甚至 3072），Judge 调用默认 512。上表不含 retry，每次 retry 额外 +1 gen 调用。
+每次 gen 输出上限 768 token（retry 时翻倍），每次 judge 输出上限 512 token。
 
-### 5.2 每次干预节省的调用数
+**每次干预的节省量**（相对 52 次上限）：
 
-以 35 次为无干预上限，每次剪枝/早停实际节省的调用数取决于发生时机：
+| 干预时机 | 被跳过的阶段 | 节省调用 | 占上限 |
+|----------|-------------|---------|--------|
+| 1 个 Seed 后 prune | Storyline + Char + Outline + 4 Scenes + Final | **15** | 29% |
+| 1 个 Storyline 后 prune | Char + Outline + 4 Scenes + Final | **13** | 25% |
+| 1 个 Characters 后 prune | Outline + 4 Scenes + Final | **11** | 21% |
+| 1 个 Outline 后 prune | 4 Scenes + Final | **9** | 17% |
+| 1 个 Scene 2 后早停 | 剩余 2 场的 gen+judge | **4** | 8% |
+| Similarity dedup 1 个分支 | 同对应阶段 | 9–15 | — |
 
-| 干预时机 | 已消耗（该分支） | 被跳过的阶段 | 节省调用 |
-|----------|-----------------|-------------|---------|
-| Seed 后 prune | gen+judge=2 | Storyline + Char + Outline + 4 Scenes + Final | **15** |
-| Storyline 后 prune | 4 | Char + Outline + 4 Scenes + Final | **13** |
-| Characters 后 prune | 6 | Outline + 4 Scenes + Final | **11** |
-| Outline 后 prune | 8 | 4 Scenes + Final | **9** |
-| Scene 2 后早停 | 已完成 2 场 | 剩余 2 场的 gen+judge | **4** |
-| Similarity dedup | 视去重阶段而定 | 同对应阶段的 prune | 9–15 |
+### 5.2 真实实验：Qwen3-8B + LLM Judge
 
-**逻辑**：越早剪掉劣质分支，节省越多。Seed 阶段一次 prune（15 调用）约等于节省了 43% 的最大调用预算。
+实验配置：
 
-### 5.3 Judge 开销是否值得
+```bash
+conda run -n fhyvllm python run_pipeline.py \
+  --backend hf \
+  --model-path /data/fhy/models/Qwen3-8B \
+  --device-map none --dtype fp16 \
+  --judge-backend llm \
+  --prompt-id script_001 \
+  --min-branches 3 --max-branches 5 --max-active-branches 3 \
+  --min-scenes 3 --max-scenes 4 \
+  --max-new-tokens 1024 --scene-max-new-tokens 1536 \
+  --temperature 0.55
+```
 
-相比"不用 controller，所有分支跑完再评选"的方案（17 gen + 2 final judge = 19 调用），controller 额外增加了 16 次 intermediate judge（35 − 19）。
+同一 prompt 跑三组：默认 controller、controller 但禁用 fork、no-controller。
 
-- **若 1 个分支在 Stage 2 被 prune**：额外开销 16 judge，节省 13 调用 → 净增 3 调用，但避免了 4 场低质量 scene 的生成。
-- **若 1 个分支在 Stage 1 被 prune**：额外 16，节省 15 → 接近持平。
-- **若 0 个分支被 prune**：controller 是纯开销（+16 judge），但这只有在两个分支质量完全相等且都很好的理想情况下才会发生。
+| 模式 | 输出目录 | Calls | Judge Calls | Tokens | Branches | Final Overall | Surprise | 选中分支 |
+|------|----------|------:|------------:|-------:|---------:|--------------:|---------:|----------|
+| Controller + fork | `outputs/qwen8b_llmjudge_ctl_script001` | 62 | 31 | 77,822 | 5 | 4.5 | 4.5 | b3 |
+| Controller, no fork | `outputs/qwen8b_llmjudge_ctl_nofork_script001` | 52 | 26 | 66,920 | 3 | 4.5 | 4.5 | b1 |
+| No-controller | `outputs/qwen8b_llmjudge_noctl_script001` | 51 | 26 | 65,395 | 3 | 4.5 | 4.5 | b3 |
 
-**结论**：controller 的净收益来自**避免在劣质分支上浪费昂贵的 scene 生成调用**（每个 scene gen 输出上限 768 token，而 judge 输出上限 512 token）。只要至少剪掉 1 个分支，token 层面基本持平或略省；真正的收益是质量——避免把劣质内容写进最终剧本。
+相对 no-controller：
 
-### 5.4 何处真正省 Token
+| 模式 | Calls 变化 | Token 变化 | 结论 |
+|------|-----------:|-----------:|------|
+| Controller + fork | +11 / +21.6% | +12,427 / +19.0% | 默认 fork 抵消并超过剪枝收益 |
+| Controller, no fork | +1 / +2.0% | +1,525 / +2.3% | 几乎持平，但没有省 token |
 
-Controller 省的不是 judge 调用本身，而是**被剪分支后续 stage 的 gen 调用**。Gen 调用的 prompt 随上下文累积而膨胀（scene 阶段 prompt 包含 task_card + storyline + characters + outline + previous_text，可达 1500+ token 输入），输出上限 768 token。Judge 调用的 prompt 较短（candidate 截断 + task_prompt），输出上限 512 token。因此：
+本次真实实验不能支持“controller 默认节省 token”的结论。
 
-- 每跳过一次 scene gen → 节省 ~1500 input + ~768 output token
-- 每跳过一次 judge → 节省 ~800 input + ~200 output token
-- 总账：跳过一个 gen 的收益大约是跳过一个 judge 的 2–3 倍
+### 5.3 为什么这次没有省 Token
 
-Controller 的设计目标就是**用便宜的 judge 调用去避免昂贵的 gen 调用**。
+Fork 发生在 **Storyline 阶段**（seed → storyline 展开之后，controller_prune 之前）：
 
-### 5.5 实验观测
+```python
+# pipeline.py: 所有活跃分支完成 storyline gen+judge 后
+for parent in list(active):          # 遍历已有分支
+    if branch_count >= max_branches: break
+    if rank(parent) < 3.85: continue # 排名不够高，不 fork
+    # 为高分父分支生成一个"改变冲突/反转机制"的兄弟分支
+    fork_seed = call(fork_seed_prompt)    # 1 gen  — 新 seed
+    judge(fork_seed)                      # 1 judge
+    fork_storyline = call(storyline_prompt) # 1 gen  — 新 storyline
+    judge(fork_storyline)                 # 1 judge
+    # Fork 分支此时已有 seed + storyline，后续继续走 characters → outline → scenes
+```
 
-| 实验 | 调用数 | vs 上限 35 | 说明 |
-|------|--------|-----------|------|
-| Qwen3-8B + LLM judge v1 | 34 | −1（~3%） | 几乎无剪枝 |
-| Qwen3-8B + LLM judge v2 | 30 | −5（~14%） | 少量剪枝或早停 |
-| DeepSeek v4 Pro v2 | 20 | −15（~43%） | 明显剪枝 + 早停 |
+**每次 fork 立即消耗 4 次调用**（2 gen + 2 judge），然后 fork 分支被加入分支池，后续 characters / outline / scenes 阶段会继续产生调用。如果 fork 分支在 storyline 阶段就被 similarity prune 剪掉（如 trace 中的 b4），这 4 次调用就是纯浪费——fork_score_threshold 需要仔细调参来避免这种情况。
 
-这些数字与模型行为直接相关：DeepSeek 生成质量更高、分支差异更大，controller 的相似度去重和 active-prune-margin 更容易触发；而本地 8B 模型两个分支常趋同，剪枝机会少。**节省率因模型而异，不应被当作常数。**
+本次 `script_001` 的实际事件：
 
-### 5.6 限制与注意事项
+- 默认 controller 触发 2 次 fork，分支数从 3 增到 5。
+- b2 在 storyline 后被 `active_prune_margin` 剪掉，b4 fork 后在 storyline 被 `controller_width_limit` 剪掉。
+- b5 是从 b2 fork 出来的新分支，存活并完整跑到 scene_4。
+- 最终仍有 b1、b3、b5 三个分支完整跑完 4 场，scene 生成没有减少。
+- `stopped_scene_count=0`，没有触发 scene early-stop。
+- no-controller 中 b2 在 scene_3 后 `no_more_scene_goals` 完成，只生成 3 场；默认 controller 反而生成了更多 scene。
 
-1. **没有实现无 controller 对照组**：目前 pipeline 始终运行 controller，上述节省估算是对"如果所有分支跑满所有阶段"的理论上限推算，而非实测对照。
-2. **Retry 机制增加方差**：`finish_reason=length` 或 JSON 解析失败会触发重试（token limit 翻倍），实际调用数可能超出 35。真实情况下需要将 retry 成本也纳入。
-3. **与 one-shot 的对比是不同维度**：one-shot 只需 1 次调用，但完全没有多分支探索和质量保障。controller 的价值不在与 one-shot 比 token 效率，而在于：相比 naive multi-branch（全跑完），controller 削减了不必要的开销；相比 one-shot，controller 用合理的额外预算换取了多分支探索带来的质量提升。
-4. **节省率需要通过对照实验验证**：要得到可靠的 "token 节省 X%" 结论，需要在同一 prompt 集合上跑 "无 controller 的固定 multi-branch" 和 "带 controller 的动态多分支" 两组的对比实验。
+禁用 fork 后也没有省 token：唯一 prune 发生在 b2 的 scene_4 之后，此时昂贵的 scene 生成已经完成，只少了最终候选评审，收益很小。
+
+### 5.4 结论边界
+
+当前结论只覆盖 `script_001` 单条 prompt，但它已经足够推翻 README 里原先“mock 节省可外推到真实 LLM”的表述。
+
+- Controller 要省 token，必须在 seed/storyline/characters/outline 等早期剪掉分支，或在 scene 阶段早停；晚到 scene_4 的 prune 基本没有成本收益。
+- Fork 是额外探索机制，不是节省机制。除非 fork 分支最终显著提高质量，否则默认开启 fork 可能增加 token。
+- Mock 后端只能验证 pipeline 机制和理论上限，不能作为真实 token 节省证据。
+- 真实节省率需要在目标模型和目标 prompt 集合上实测，并且要同时报告质量分数；只报告 calls/tokens 会掩盖 fork 是否换来了更好的结果。
+
+### 5.5 Mock 的定位
+
+[MockLLM](src/scriptts/llm.py#L34) 是确定性假后端：每个 stage 返回固定伪 JSON，Judge 固定返回 4.0。它适合做 smoke test、trace 检查、controller 机制回归测试；不适合论证真实 LLM 的 token 节省。
 
 ---
 
@@ -269,9 +309,9 @@ python3 run_pipeline.py \
 |------|------|------|
 | `--backend` | `auto` | `mock` / `hf` / `deepseek` |
 | `--judge-backend` | `llm` | `rule` / `llm` / `hybrid` |
-| `--max-branches` | 2 | 最大分支数 |
+| `--max-branches` | 5 | 最大分支总数（含 fork） |
 | `--min-branches` | 3 | 初始种子数 |
-| `--max-active-branches` | 2 | 并行活跃分支上限 |
+| `--max-active-branches` | 3 | 并行活跃分支上限 |
 | `--max-scenes` | 4 | 最大场数 |
 | `--min-scenes` | 3 | 最少场数 |
 | `--max-new-tokens` | 768 | 普通阶段生成长度 |
@@ -280,6 +320,9 @@ python3 run_pipeline.py \
 | `--fork-score-threshold` | 3.85 | 触发 fork 的排名阈值 |
 | `--active-prune-margin` | 0.75 | 弱分支剪枝边距 |
 | `--similarity-prune-threshold` | 0.72 | 相似分支去重阈值 |
+| `--disable-controller` | false | 关闭所有 prune/stop/fork，所有分支跑满 |
+| `--disable-fork` | false | 仅关闭 fork |
+| `--oneshot` | false | 单次调用生成，跳过多阶段 pipeline |
 
 ---
 
@@ -309,7 +352,27 @@ outputs/{run_name}/
 
 ---
 
-## 8. 近期实验
+## 8. 实验
+
+### 8.1 真实 Token 对照（Qwen3-8B + LLM Judge）
+
+`script_001`，同一 prompt、同一模型、同一 LLM judge，参数见 [Section 5.2](#52-真实实验qwen3-8b--llm-judge)。
+
+| 模式 | API Calls | Tokens | Overall | Surprise | 选中分支 |
+|------|----------:|-------:|--------:|---------:|----------|
+| Controller + fork | 62 | 77,822 | 4.5 | 4.5 | b3 |
+| Controller, no fork | 52 | 66,920 | 4.5 | 4.5 | b1 |
+| No-controller | 51 | 65,395 | 4.5 | 4.5 | b3 |
+
+观察：
+- 默认 controller 没有省 token；相对 no-controller 多 12,427 tokens（+19.0%）。
+- 禁用 fork 后仍没有省 token；相对 no-controller 多 1,525 tokens（+2.3%）。
+- 默认 controller 与 no-controller 都选中 b3，最终评分持平；no-fork 选中 b1，但评分也持平。
+- 默认 controller 的额外成本来自 2 次 fork，其中 b5 存活并完整跑到 scene_4；剪枝没有减少最终 scene 生成数量。
+
+### 8.2 历史真实 LLM 实验（旧默认值 max_branches=2）
+
+这些记录来自旧默认值和不同实验设置，主要用于质量与兼容性观察；它们不是当前默认配置下的 controller/no-controller token 对照。
 
 | 配置 | API Calls | Tokens | Overall | Surprise |
 |------|-----------|--------|---------|----------|
@@ -321,6 +384,12 @@ outputs/{run_name}/
 - LLM judge 比 rule judge 更能避免"AI 知道答案 = 作弊"类前提错误
 - DeepSeek 在 seed/storyline/characters 阶段质量显著高于本地 8B，但 JSON 截断问题需要 retry 机制
 - 4 场完整写完但结尾停留在"等待抉择"仍是主要质量问题
+
+### 8.3 小结
+
+- **Token 不应再用 mock 结果论证。** Mock 只说明机制上能剪枝，不能代表真实 LLM 的成本。
+- **当前真实 8B 单条实验没有节省。** 默认 fork 增加探索成本，且剪枝没有早到足以跳过 scene 生成。
+- **真正可能省 token 的路径**仍然是 early prune、similarity dedup、scene early-stop；但必须在目标模型和 prompt 集上实测。
 
 ---
 
@@ -366,3 +435,4 @@ ScripTTS/
 - **Searching for Surprise** (Yannakakis et al., 2016) — Surprise 作为计算创造力信号
 - **AutoTTS** (Zheng et al., 2026) — 测试时推理控制策略自动发现
 - **Parallel-Probe** (Zheng et al., 2026) — 分支管理 + 共识早停
+

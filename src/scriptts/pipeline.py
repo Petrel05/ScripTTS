@@ -14,9 +14,9 @@ from .surprise import JudgeScores, build_llm_judge_prompt, parse_llm_judge_respo
 
 @dataclass
 class PipelineConfig:
-    max_branches: int = 2
+    max_branches: int = 5
     min_branches: int = 3
-    max_active_branches: int = 2
+    max_active_branches: int = 3
     fork_enabled: bool = True
     fork_score_threshold: float = 3.85
     active_prune_margin: float = 0.75
@@ -27,6 +27,8 @@ class PipelineConfig:
     scene_max_new_tokens: int = 768
     temperature: float = 0.7
     judge_backend: str = "llm"
+    controller_enabled: bool = True
+    oneshot: bool = False
 
 
 @dataclass
@@ -143,6 +145,9 @@ class ScriptPipeline:
         self.config = config
 
     def run_task(self, task: ScriptTask) -> PipelineResult:
+        if self.config.oneshot:
+            return self._run_oneshot(task)
+
         started = time.time()
         stats = PipelineStats()
 
@@ -197,22 +202,29 @@ class ScriptPipeline:
             branch = BranchState(branch_id=idx, seed=seed, seed_data=seed_data)
             branch.scores["seed"] = score.to_dict()
             invalid, invalid_reason = _invalid_reason(score, stage="branch")
-            branch.status = "pruned" if invalid else "active"
+            if self.config.controller_enabled:
+                branch.status = "pruned" if invalid else "active"
+            else:
+                branch.status = "active"
+                invalid_reason = ""
             branch.decisions.append(_decision_event("seed", "prune" if invalid else "keep", invalid_reason or "initial_branch", score.to_dict()))
             branches.append(branch)
             stats.branch_count += 1
             previous_seed += "\n" + seed
             controller_events.append(_controller_event("INIT_BRANCH", branch.branch_id, "seed", branch.status, score.to_dict(), invalid_reason or "initial_seed"))
 
-        _rescue_seed_branches(branches, self.config.max_active_branches, controller_events)
-        active = _controller_prune(
-            branches,
-            self.config.max_active_branches,
-            controller_events,
-            "seed",
-            self.config.active_prune_margin,
-            self.config.similarity_prune_threshold,
-        )
+        if self.config.controller_enabled:
+            _rescue_seed_branches(branches, self.config.max_active_branches, controller_events)
+            active = _controller_prune(
+                branches,
+                self.config.max_active_branches,
+                controller_events,
+                "seed",
+                self.config.active_prune_margin,
+                self.config.similarity_prune_threshold,
+            )
+        else:
+            active = [b for b in branches if b.status == "active"]
 
         for branch in list(active):
             storyline_raw = call(_storyline_prompt(task, task_card, branch.seed), expect_json=True)
@@ -224,7 +236,7 @@ class ScriptPipeline:
             branch.stage = "storyline"
             branch.decisions.append(_decision_event("storyline", "keep", "expanded_storyline", score.to_dict()))
             controller_events.append(_controller_event("EXPAND_STORYLINE", branch.branch_id, "storyline", branch.status, score.to_dict(), "depth+1"))
-        if self.config.fork_enabled:
+        if self.config.controller_enabled and self.config.fork_enabled:
             for parent in list(active):
                 if stats.branch_count >= self.config.max_branches:
                     break
@@ -256,14 +268,17 @@ class ScriptPipeline:
                 fork_branch.decisions.append(_decision_event("storyline", "keep", "expanded_fork_storyline", storyline_score.to_dict()))
                 controller_events.append(_controller_event("EXPAND_STORYLINE", fork_branch.branch_id, "storyline", fork_branch.status, storyline_score.to_dict(), "fork_depth+1"))
 
-        active = _controller_prune(
-            branches,
-            self.config.max_active_branches,
-            controller_events,
-            "storyline",
-            self.config.active_prune_margin,
-            self.config.similarity_prune_threshold,
-        )
+        if self.config.controller_enabled:
+            active = _controller_prune(
+                branches,
+                self.config.max_active_branches,
+                controller_events,
+                "storyline",
+                self.config.active_prune_margin,
+                self.config.similarity_prune_threshold,
+            )
+        else:
+            active = [b for b in branches if b.status == "active"]
 
         for branch in list(active):
             characters_raw = call(_character_prompt(task, task_card, branch.storyline), expect_json=True)
@@ -275,14 +290,17 @@ class ScriptPipeline:
             branch.stage = "characters"
             branch.decisions.append(_decision_event("characters", "keep", "expanded_characters", score.to_dict()))
             controller_events.append(_controller_event("EXPAND_CHARACTERS", branch.branch_id, "characters", branch.status, score.to_dict(), "depth+1"))
-        active = _controller_prune(
-            branches,
-            self.config.max_active_branches,
-            controller_events,
-            "characters",
-            self.config.active_prune_margin,
-            self.config.similarity_prune_threshold,
-        )
+        if self.config.controller_enabled:
+            active = _controller_prune(
+                branches,
+                self.config.max_active_branches,
+                controller_events,
+                "characters",
+                self.config.active_prune_margin,
+                self.config.similarity_prune_threshold,
+            )
+        else:
+            active = [b for b in branches if b.status == "active"]
 
         for branch in list(active):
             outline_raw = call(_outline_prompt(task, task_card, branch.storyline, branch.characters), expect_json=True)
@@ -295,14 +313,17 @@ class ScriptPipeline:
             branch.stage = "outline"
             branch.decisions.append(_decision_event("outline", "keep", "expanded_outline", score.to_dict()))
             controller_events.append(_controller_event("EXPAND_OUTLINE", branch.branch_id, "outline", branch.status, score.to_dict(), "depth+1"))
-        active = _controller_prune(
-            branches,
-            self.config.max_active_branches,
-            controller_events,
-            "outline",
-            self.config.active_prune_margin,
-            self.config.similarity_prune_threshold,
-        )
+        if self.config.controller_enabled:
+            active = _controller_prune(
+                branches,
+                self.config.max_active_branches,
+                controller_events,
+                "outline",
+                self.config.active_prune_margin,
+                self.config.similarity_prune_threshold,
+            )
+        else:
+            active = [b for b in branches if b.status == "active"]
 
         for scene_idx in range(1, self.config.max_scenes + 1):
             scene_active = [branch for branch in active if branch.status == "active"]
@@ -338,9 +359,12 @@ class ScriptPipeline:
                 score = self._judge(scene_text, scene_judge_context, generated_so_far, stats)
                 score_dict = score.to_dict()
                 branch.scores["scene"] = score_dict
-                stop, reason = _branch_scene_stop(branch, score, scene_idx, self.config.min_scenes)
-                if scene_data.get("parse_error"):
-                    stop, reason = True, "scene_parse_error"
+                if self.config.controller_enabled:
+                    stop, reason = _branch_scene_stop(branch, score, scene_idx, self.config.min_scenes)
+                    if scene_data.get("parse_error"):
+                        stop, reason = True, "scene_parse_error"
+                else:
+                    stop, reason = False, "controller_disabled"
                 decision = "accept_and_stop" if stop else "accept"
                 branch.scenes.append(
                     {
@@ -356,18 +380,22 @@ class ScriptPipeline:
                 )
                 branch.stage = f"scene_{scene_idx}"
                 if stop:
-                    branch.status = "pruned" if reason in {"scene_parse_error", "premise_flaw", "low_logic_consistency", "low_overall_quality"} else "completed"
+                    if self.config.controller_enabled:
+                        branch.status = "pruned" if reason in {"scene_parse_error", "premise_flaw", "low_logic_consistency", "low_overall_quality"} else "completed"
+                    else:
+                        branch.status = "completed"
                     stats.stopped_scene_count += 1
                 branch.decisions.append(_decision_event(f"scene_{scene_idx}", decision, reason, score_dict))
                 controller_events.append(_controller_event("EXPAND_SCENE", branch.branch_id, f"scene_{scene_idx}", branch.status, score_dict, reason))
-            active = _controller_prune(
-                branches,
-                self.config.max_active_branches,
-                controller_events,
-                f"scene_{scene_idx}",
-                self.config.active_prune_margin,
-                self.config.similarity_prune_threshold,
-            )
+            if self.config.controller_enabled:
+                active = _controller_prune(
+                    branches,
+                    self.config.max_active_branches,
+                    controller_events,
+                    f"scene_{scene_idx}",
+                    self.config.active_prune_margin,
+                    self.config.similarity_prune_threshold,
+                )
 
         for branch in branches:
             if branch.status == "active" and branch.scenes:
@@ -393,9 +421,9 @@ class ScriptPipeline:
             final_score = _calibrate_final_completion(final_score, branch)
             branch.scores["final"] = final_score.to_dict()
             final_invalid, final_invalid_reason = _invalid_reason(final_score)
-            if final_invalid:
+            if self.config.controller_enabled and final_invalid:
                 branch.status = "pruned"
-            final_decision = "reject" if final_invalid else "candidate"
+            final_decision = "reject" if (self.config.controller_enabled and final_invalid) else "candidate"
             final_reason = final_invalid_reason or "final_judge"
             branch.decisions.append(_decision_event("final", final_decision, final_reason, final_score.to_dict()))
             controller_events.append(_controller_event("FINAL_JUDGE", branch.branch_id, "final", branch.status, final_score.to_dict(), final_reason))
@@ -456,6 +484,22 @@ class ScriptPipeline:
             },
             "metrics": stats.to_dict(),
             "raw_outputs": raw_outputs,
+        }
+        return PipelineResult(task_id=task.id, final_script=final_script, record=record)
+
+    def _run_oneshot(self, task: ScriptTask) -> PipelineResult:
+        started = time.time()
+        stats = PipelineStats()
+        prompt = _oneshot_prompt(task)
+        generation = self.llm.generate(prompt, max_new_tokens=self.config.scene_max_new_tokens * 2, temperature=self.config.temperature)
+        stats.add_generation(generation.input_tokens, generation.output_tokens, generation.diagnostics)
+        final_script = generation.text.strip()
+        stats.wall_time = time.time() - started
+        record = {
+            "task": {"id": task.id, "genre": task.genre, "theme": task.theme, "user_prompt": task.user_prompt, "constraints": task.constraints},
+            "method": "oneshot",
+            "final_script": final_script,
+            "metrics": stats.to_dict(),
         }
         return PipelineResult(task_id=task.id, final_script=final_script, record=record)
 
@@ -1395,6 +1439,25 @@ def _parse_dialogue_lines(text: str, character_names: list[str] | None = None) -
         if speaker and content.strip():
             dialogue.append({"speaker": speaker, "line": content.strip()})
     return dialogue
+
+
+def _oneshot_prompt(task: ScriptTask) -> str:
+    return f"""请根据以下要求，直接生成一部完整的短剧剧本。
+
+类型：{task.genre}
+主题：{task.theme}
+用户需求：{task.user_prompt}
+约束：{task.constraints}
+
+输出格式要求：
+- 包含标题
+- 包含人物表（姓名、角色功能、目标、动机、关系）
+- 包含分场大纲（3-5场）
+- 包含完整正文剧本（对白格式，含舞台说明和动作描述）
+- 结尾需要有明确的收束或反转
+
+请直接输出完整剧本，不要输出 JSON，不要输出 Markdown 代码块。
+"""
 
 
 def _normalization_prompt(task: ScriptTask) -> str:

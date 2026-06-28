@@ -40,6 +40,8 @@ def main() -> None:
         scene_max_new_tokens=args.scene_max_new_tokens,
         temperature=args.temperature,
         judge_backend=args.judge_backend,
+        controller_enabled=not args.disable_controller,
+        oneshot=args.oneshot,
     )
     pipeline = ScriptPipeline(llm=llm, config=config)
 
@@ -57,12 +59,19 @@ def main() -> None:
         save_result_markdown(scripts_dir / f"{result.task_id}.md", result)
         save_trace_markdown(traces_dir / f"{result.task_id}.md", result)
         metrics = result.record["metrics"]
-        score = result.record["final_score"]
-        print(
-            "[ScripTTS] done "
-            f"{task.id} overall={score['overall_quality']} surprise={score['useful_surprise']} "
-            f"calls={metrics['api_calls']} tokens={metrics['total_tokens']}"
-        )
+        if result.record.get("method") == "oneshot":
+            print(
+                "[ScripTTS] done "
+                f"{task.id} (oneshot) "
+                f"calls={metrics['api_calls']} tokens={metrics['total_tokens']}"
+            )
+        else:
+            score = result.record.get("final_score", {})
+            print(
+                "[ScripTTS] done "
+                f"{task.id} overall={score.get('overall_quality','?')} surprise={score.get('useful_surprise','?')} "
+                f"calls={metrics['api_calls']} tokens={metrics['total_tokens']}"
+            )
 
     write_jsonl(output_dir / "results.jsonl", records)
     print(f"[ScripTTS] wrote {output_dir / 'results.jsonl'}")
@@ -131,10 +140,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-reasoning-effort", choices=["low", "medium", "high", ""], default="medium", help="Reasoning effort for compatible APIs.")
 
     parser.add_argument("--judge-backend", choices=["rule", "llm", "hybrid"], default="llm")
-    parser.add_argument("--max-branches", type=int, default=2)
+    parser.add_argument("--max-branches", type=int, default=5)
     parser.add_argument("--min-branches", type=int, default=3)
-    parser.add_argument("--max-active-branches", type=int, default=2)
+    parser.add_argument("--max-active-branches", type=int, default=3)
     parser.add_argument("--disable-fork", action="store_true")
+    parser.add_argument("--disable-controller", action="store_true", help="Disable all prune/stop/fork; run all branches through all stages.")
+    parser.add_argument("--oneshot", action="store_true", help="Single-call generation, no multi-stage pipeline.")
     parser.add_argument("--fork-score-threshold", type=float, default=3.85)
     parser.add_argument("--active-prune-margin", type=float, default=0.75)
     parser.add_argument("--similarity-prune-threshold", type=float, default=0.72)
